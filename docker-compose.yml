@@ -1,0 +1,33 @@
+services:
+  qwen3_asr:
+    build: .
+    container_name: qwen3_asr_openai
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # 模型升级/切换：改这里重启即可（0.6B更省，1.7B更强）
+      MODEL_ID: "Qwen/Qwen3-ASR-1.7B"
+      # 可选：锁定到某个 revision/commit（用于可复现）
+      # MODEL_REVISION: "main"
+
+      # 推理参数
+      DEVICE_MAP: "cuda:0"       # 多卡可写 "cuda:0" 或 "auto"
+      DTYPE: "bfloat16"          # cpu 用 float32
+      MAX_NEW_TOKENS: "512"
+      MAX_BATCH: "8"
+
+      # HF 缓存目录（自动下载模型）
+      HF_HOME: "/models"
+
+      # 热重载保护（可选）
+      ADMIN_TOKEN: "change-me"
+    volumes:
+      - ./models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
