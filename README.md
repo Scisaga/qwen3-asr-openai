@@ -14,6 +14,13 @@ docker compose up -d --build
 
 说明：容器启动时会自动下载并加载模型（首次启动可能需要较长时间）；模型就绪后才会开始对外提供 HTTP 服务。
 
+如果机器需要走代理才能访问 HuggingFace，可在同目录创建 `.env`（或启动前导出环境变量）：
+```bash
+HTTP_PROXY=http://127.0.0.1:7890
+# 可选：不走代理的地址（默认：localhost,127.0.0.1）
+# NO_PROXY=localhost,127.0.0.1
+```
+
 打开：
 - Web UI：http://localhost:8000/
 - 健康检查：http://localhost:8000/health
