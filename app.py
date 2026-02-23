@@ -21,7 +21,7 @@ MODEL_REVISION = os.getenv("MODEL_REVISION")  # optional
 DEVICE_MAP = os.getenv("DEVICE_MAP", "cuda:0")
 DTYPE = os.getenv("DTYPE", "bfloat16")
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "512"))
-MAX_BATCH = int(os.getenv("MAX_BATCH", "8"))
+MAX_BATCH = int(os.getenv("MAX_BATCH", "1"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 _model = None
@@ -581,17 +581,22 @@ def index():
       try{
         const fd = new FormData(form);
         const resp = await fetch('/v1/audio/transcriptions', { method: 'POST', body: fd });
-        let j = {};
-        try{ j = await resp.json(); }catch(_){}
+        let j = null;
+        let rawText = '';
+        try{
+          j = await resp.json();
+        }catch(_){
+          try{ rawText = await resp.text(); }catch(__){}
+        }
 
         if (!resp.ok){
-          const detail = (j && j.detail) ? j.detail : j;
+          const detail = (j && j.detail) ? j.detail : (j ?? rawText);
           out.value = typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2);
           hint.textContent = `失败：HTTP ${resp.status}`;
           return;
         }
 
-        out.value = j.text || JSON.stringify(j, null, 2);
+        out.value = (j && j.text) ? j.text : JSON.stringify(j, null, 2);
         hint.textContent = '完成';
       }catch(err){
         out.value = String(err);
@@ -641,9 +646,33 @@ async def transcriptions(
         wav_path = _to_wav16k_mono(in_path)
         lang = _map_language(language)
 
-        # qwen-asr: transcribe(audio=..., language=...)
-        results = _model.transcribe(audio=wav_path, language=lang)
-        r0 = results[0]
+        try:
+            # qwen-asr: transcribe(audio=..., language=...)
+            results = _model.transcribe(audio=wav_path, language=lang)
+            r0 = results[0]
+        except torch.cuda.OutOfMemoryError as e:
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=507,
+                detail={
+                    "error": "cuda_oom",
+                    "message": "CUDA 显存不足：当前模型/输入在推理时超出 GPU 可用显存。",
+                    "tips": [
+                        "将 MAX_BATCH 调小（建议 1）",
+                        "将 MAX_NEW_TOKENS 调小（如 128/256）",
+                        "换更小模型（如 Qwen/Qwen3-ASR-0.6B）或使用更多 GPU",
+                        "超长音频/视频建议先截短或分段再转写",
+                    ],
+                    "exception": str(e),
+                },
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail={"error": "transcribe_failed", "exception": str(e)})
 
         return JSONResponse({
             "text": r0.text,

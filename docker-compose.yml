@@ -15,7 +15,7 @@ services:
       DEVICE_MAP: "cuda:0"       # 多卡可写 "cuda:0" 或 "auto"
       DTYPE: "bfloat16"          # cpu 用 float32
       MAX_NEW_TOKENS: "512"
-      MAX_BATCH: "8"
+      MAX_BATCH: "1"             # 1.7B 模型/长音频更稳；显存充足可调大提升吞吐
 
       # HF 缓存目录（自动下载模型）
       HF_HOME: "/models"
