@@ -31,7 +31,7 @@ def _torch_dtype(dtype_str: str):
 def _load_model(model_id: str, revision: Optional[str] = None):
     global _model
     kwargs = dict(
-        dtype=_torch_dtype(DTYPE),
+        torch_dtype=_torch_dtype(DTYPE),
         device_map=DEVICE_MAP,
         max_inference_batch_size=MAX_BATCH,
         max_new_tokens=MAX_NEW_TOKENS,
