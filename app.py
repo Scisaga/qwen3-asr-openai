@@ -6,9 +6,15 @@ from typing import Optional
 import torch
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from qwen_asr import Qwen3ASRModel
 
 app = FastAPI()
+app.mount(
+    "/static",
+    StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")),
+    name="static",
+)
 
 MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen3-ASR-1.7B")
 MODEL_REVISION = os.getenv("MODEL_REVISION")  # optional
@@ -75,6 +81,9 @@ def index():
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="theme-color" content="#0b1224"/>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg"/>
+  <link rel="apple-touch-icon" href="/static/logo.svg"/>
   <title>Qwen3-ASR</title>
   <style>
     :root{
@@ -136,8 +145,8 @@ def index():
     }
     .mark{
       width:34px; height:34px; border-radius:12px;
-      background: linear-gradient(135deg, rgba(96,165,250,.92), rgba(34,197,94,.88));
       box-shadow: 0 12px 30px rgba(34,197,94,.14), 0 12px 30px rgba(96,165,250,.16);
+      display:block;
     }
     .brand-title{font-weight:700; letter-spacing:.2px}
     .brand-sub{font-size:12px; color:var(--muted2); margin-top:2px}
@@ -360,7 +369,7 @@ def index():
   <div class="app">
     <aside class="sidebar">
       <div class="brand">
-        <div class="mark" aria-hidden="true"></div>
+        <img class="mark" src="/static/logo.svg" alt="Qwen3-ASR"/>
         <div>
           <div class="brand-title">Qwen3-ASR</div>
           <div class="brand-sub">OpenAI 兼容接口 · Web 上传</div>

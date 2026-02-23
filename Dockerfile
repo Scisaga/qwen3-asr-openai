@@ -9,5 +9,6 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app.py /app/app.py
 COPY server.py /app/server.py
+COPY static /app/static
 EXPOSE 8000
 CMD ["python", "-u", "server.py"]
