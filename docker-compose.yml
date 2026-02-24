@@ -25,6 +25,9 @@ services:
       HTTP_PROXY: ${HTTP_PROXY:-}
       NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
 
+      # 服务端口（默认 12301）
+      PORT: "12301"
+
       # 热重载保护（可选）
       ADMIN_TOKEN: "change-me"
     volumes:
@@ -36,4 +39,3 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-      PORT: "12301"
