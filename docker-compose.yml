@@ -4,7 +4,7 @@ services:
     container_name: qwen3_asr_openai
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "12301:12301"
     environment:
       # 模型升级/切换：改这里重启即可（0.6B更省，1.7B更强）
       MODEL_ID: "Qwen/Qwen3-ASR-1.7B"
@@ -36,3 +36,4 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+      PORT: "12301"

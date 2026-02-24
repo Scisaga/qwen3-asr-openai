@@ -22,8 +22,8 @@ HTTP_PROXY=http://127.0.0.1:7890
 ```
 
 打开：
-- Web UI：http://localhost:8000/
-- 健康检查：http://localhost:8000/health
+- Web UI：http://localhost:12301/
+- 健康检查：http://localhost:12301/health
 
 ## 切换模型（需重启）
 在 `docker-compose.yml` 中修改 `MODEL_ID`，然后：
@@ -33,7 +33,7 @@ docker compose up -d
 
 ## 模型热重载（无需重启）
 ```bash
-curl -X POST http://localhost:8000/admin/reload \
+curl -X POST http://localhost:12301/admin/reload \
   -H "Content-Type: application/json" \
   -H "x-admin-token: change-me" \
   -d '{"model_id":"Qwen/Qwen3-ASR-0.6B"}'

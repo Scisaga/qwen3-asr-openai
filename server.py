@@ -31,7 +31,7 @@ def _apply_proxy_env() -> None:
 def main() -> None:
     preload_model = _env_flag("PRELOAD_MODEL", "1")
     host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.getenv("PORT", "12301"))
 
     _apply_proxy_env()
 

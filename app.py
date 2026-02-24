@@ -619,7 +619,7 @@ def index():
               </div>
               <div class="card-body">
                 <div class="code">
-                  <code>curl -X POST http://localhost:8000/v1/audio/transcriptions -F file=@audio.mp3 -F language=zh</code>
+                  <code>curl -X POST http://localhost:12301/v1/audio/transcriptions -F file=@audio.mp3 -F language=zh</code>
                 </div>
                 <div class="muted small">提示：也可以直接打开 <a href="/docs" target="_blank" rel="noreferrer" class="muted">/docs</a> 使用 Swagger 调用。</div>
               </div>
