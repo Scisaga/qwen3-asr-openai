@@ -1,4 +1,6 @@
 import os
+import math
+import shutil
 import tempfile
 import subprocess
 from typing import Optional
@@ -23,6 +25,8 @@ DTYPE = os.getenv("DTYPE", "bfloat16")
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "512"))
 MAX_BATCH = int(os.getenv("MAX_BATCH", "1"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+CHUNK_SECONDS = float(os.getenv("CHUNK_SECONDS", "600"))
+CHUNK_OVERLAP_SECONDS = float(os.getenv("CHUNK_OVERLAP_SECONDS", "1"))
 
 _model = None
 
@@ -73,6 +77,111 @@ def _to_wav16k_mono(input_path: str) -> str:
     if p.returncode != 0:
         raise RuntimeError(p.stderr.decode("utf-8", errors="ignore")[-2000:])
     return out_path
+
+def _ffprobe_duration_seconds(path: str) -> Optional[float]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=nk=1:nw=1",
+        path,
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        return None
+    try:
+        v = float((p.stdout or "").strip())
+        if math.isfinite(v) and v > 0:
+            return v
+    except Exception:
+        return None
+    return None
+
+def _extract_wav_segment(input_wav: str, start_s: float, duration_s: float, out_wav: str) -> None:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start_s:.3f}",
+        "-t",
+        f"{duration_s:.3f}",
+        "-i",
+        input_wav,
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-vn",
+        out_wav,
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.decode("utf-8", errors="ignore")[-2000:])
+
+def _split_wav_with_overlap(input_wav: str, chunk_s: float, overlap_s: float) -> tuple[list[str], str]:
+    duration_s = _ffprobe_duration_seconds(input_wav)
+    if not duration_s:
+        return ([input_wav], "")
+
+    chunk_s = float(chunk_s)
+    overlap_s = float(overlap_s)
+    if chunk_s <= 0 or overlap_s < 0 or chunk_s <= overlap_s:
+        return ([input_wav], "")
+
+    if duration_s <= chunk_s + 0.25:
+        return ([input_wav], "")
+
+    stride_s = chunk_s - overlap_s
+    out_dir = tempfile.mkdtemp(prefix="qwen3asr_chunks_")
+    chunks: list[str] = []
+
+    start = 0.0
+    idx = 0
+    while start < duration_s - 0.05:
+        seg_dur = min(chunk_s, max(0.0, duration_s - start))
+        if seg_dur <= 0.05:
+            break
+        out_path = os.path.join(out_dir, f"chunk_{idx:06d}.wav")
+        _extract_wav_segment(input_wav, start, seg_dur, out_path)
+        chunks.append(out_path)
+        idx += 1
+        start += stride_s
+
+    if not chunks:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return ([input_wav], "")
+
+    return (chunks, out_dir)
+
+def _max_overlap_suffix_prefix(a: str, b: str, max_len: int = 160) -> int:
+    if not a or not b:
+        return 0
+    a_tail = a[-max_len:]
+    b_head = b[:max_len]
+    max_l = min(len(a_tail), len(b_head))
+    for l in range(max_l, 10, -1):
+        if a_tail[-l:] == b_head[:l]:
+            return l
+    return 0
+
+def _merge_texts_with_overlap(texts: list[str]) -> str:
+    merged = ""
+    for t in texts:
+        t = (t or "").strip()
+        if not t:
+            continue
+        if not merged:
+            merged = t
+            continue
+        ol = _max_overlap_suffix_prefix(merged, t)
+        if ol > 0:
+            merged += t[ol:]
+        else:
+            merged += ("\n" if not merged.endswith("\n") else "") + t
+    return merged
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -642,14 +751,26 @@ async def transcriptions(
         in_path = tmp.name
 
     wav_path = None
+    chunk_dir = ""
+    chunk_paths: list[str] = []
     try:
         wav_path = _to_wav16k_mono(in_path)
         lang = _map_language(language)
+        context = (prompt or "").strip()
 
         try:
-            # qwen-asr: transcribe(audio=..., language=...)
-            results = _model.transcribe(audio=wav_path, language=lang)
-            r0 = results[0]
+            chunk_paths, chunk_dir = _split_wav_with_overlap(wav_path, CHUNK_SECONDS, CHUNK_OVERLAP_SECONDS)
+            texts: list[str] = []
+            for cp in chunk_paths:
+                results = _model.transcribe(audio=cp, context=context, language=lang)
+                if results:
+                    texts.append(results[0].text)
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            merged_text = _merge_texts_with_overlap(texts)
         except torch.cuda.OutOfMemoryError as e:
             try:
                 if torch.cuda.is_available():
@@ -667,6 +788,7 @@ async def transcriptions(
                         "将 MAX_NEW_TOKENS 调小（如 128/256）",
                         "换更小模型（如 Qwen/Qwen3-ASR-0.6B）或使用更多 GPU",
                         "超长音频/视频建议先截短或分段再转写",
+                        "可尝试设置 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True（缓解显存碎片/保留块）",
                     ],
                     "exception": str(e),
                 },
@@ -675,8 +797,8 @@ async def transcriptions(
             raise HTTPException(status_code=500, detail={"error": "transcribe_failed", "exception": str(e)})
 
         return JSONResponse({
-            "text": r0.text,
-            "language": getattr(r0, "language", None),
+            "text": merged_text,
+            "language": lang,
         })
     finally:
         for p in (in_path, wav_path):
@@ -685,3 +807,5 @@ async def transcriptions(
                     os.remove(p)
                 except Exception:
                     pass
+        if chunk_dir:
+            shutil.rmtree(chunk_dir, ignore_errors=True)
