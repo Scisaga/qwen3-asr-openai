@@ -1,3 +1,4 @@
+import asyncio
 import os
 import math
 import shutil
@@ -24,11 +25,13 @@ DEVICE_MAP = os.getenv("DEVICE_MAP", "cuda:0")
 DTYPE = os.getenv("DTYPE", "bfloat16")
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "512"))
 MAX_BATCH = int(os.getenv("MAX_BATCH", "1"))
+MAX_CONCURRENT_TRANSCRIBE = int(os.getenv("MAX_CONCURRENT_TRANSCRIBE", "1"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 CHUNK_SECONDS = float(os.getenv("CHUNK_SECONDS", "600"))
 CHUNK_OVERLAP_SECONDS = float(os.getenv("CHUNK_OVERLAP_SECONDS", "1"))
 
 _model = None
+_transcribe_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_TRANSCRIBE))
 
 def _torch_dtype(dtype_str: str):
     s = (dtype_str or "").lower()
@@ -182,6 +185,42 @@ def _merge_texts_with_overlap(texts: list[str]) -> str:
         else:
             merged += ("\n" if not merged.endswith("\n") else "") + t
     return merged
+
+def _transcribe_path(in_path: str, lang: Optional[str], context: str) -> tuple[str, Optional[str]]:
+    wav_path = None
+    chunk_dir = ""
+    try:
+        wav_path = _to_wav16k_mono(in_path)
+        chunk_paths, chunk_dir = _split_wav_with_overlap(wav_path, CHUNK_SECONDS, CHUNK_OVERLAP_SECONDS)
+
+        texts: list[str] = []
+        langs: list[str] = []
+        for cp in chunk_paths:
+            results = _model.transcribe(audio=cp, context=context, language=lang)
+            if results:
+                r0 = results[0]
+                texts.append(r0.text)
+                langs.append((getattr(r0, "language", "") or "").strip())
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        merged_text = _merge_texts_with_overlap(texts)
+        merged_lang = lang
+        if not merged_lang:
+            uniq = [x for x in dict.fromkeys([x for x in langs if x])]
+            merged_lang = ",".join(uniq) if uniq else None
+        return (merged_text, merged_lang)
+    finally:
+        if wav_path and os.path.exists(wav_path):
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
+        if chunk_dir:
+            shutil.rmtree(chunk_dir, ignore_errors=True)
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -723,7 +762,17 @@ def index():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": _model is not None, "model_id": MODEL_ID, "revision": MODEL_REVISION, "device_map": DEVICE_MAP, "dtype": DTYPE}
+    return {
+        "status": "ok",
+        "model_loaded": _model is not None,
+        "model_id": MODEL_ID,
+        "revision": MODEL_REVISION,
+        "device_map": DEVICE_MAP,
+        "dtype": DTYPE,
+        "max_concurrent_transcribe": MAX_CONCURRENT_TRANSCRIBE,
+        "chunk_seconds": CHUNK_SECONDS,
+        "chunk_overlap_seconds": CHUNK_OVERLAP_SECONDS,
+    }
 
 @app.post("/admin/reload")
 async def admin_reload(request: Request):
@@ -750,27 +799,12 @@ async def transcriptions(
         tmp.write(await file.read())
         in_path = tmp.name
 
-    wav_path = None
-    chunk_dir = ""
-    chunk_paths: list[str] = []
+    lang = _map_language(language)
+    context = (prompt or "").strip()
     try:
-        wav_path = _to_wav16k_mono(in_path)
-        lang = _map_language(language)
-        context = (prompt or "").strip()
-
         try:
-            chunk_paths, chunk_dir = _split_wav_with_overlap(wav_path, CHUNK_SECONDS, CHUNK_OVERLAP_SECONDS)
-            texts: list[str] = []
-            for cp in chunk_paths:
-                results = _model.transcribe(audio=cp, context=context, language=lang)
-                if results:
-                    texts.append(results[0].text)
-                try:
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
-            merged_text = _merge_texts_with_overlap(texts)
+            async with _transcribe_sem:
+                merged_text, merged_lang = await asyncio.to_thread(_transcribe_path, in_path, lang, context)
         except torch.cuda.OutOfMemoryError as e:
             try:
                 if torch.cuda.is_available():
@@ -798,14 +832,11 @@ async def transcriptions(
 
         return JSONResponse({
             "text": merged_text,
-            "language": lang,
+            "language": merged_lang,
         })
     finally:
-        for p in (in_path, wav_path):
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-        if chunk_dir:
-            shutil.rmtree(chunk_dir, ignore_errors=True)
+        if in_path and os.path.exists(in_path):
+            try:
+                os.remove(in_path)
+            except Exception:
+                pass
