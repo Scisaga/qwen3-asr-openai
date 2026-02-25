@@ -48,3 +48,9 @@ curl -X POST http://localhost:12301/admin/reload \
 
 如果宿主机有两张 GPU，但你只想用第 2 张，可以设置 `count: 1`，并在环境变量里设置：
 - `NVIDIA_VISIBLE_DEVICES: "1"`，同时保持 `DEVICE_MAP=cuda:0`（因为容器里只“看到”那一张 GPU）。
+
+## 长音频与文本后处理（可选）
+在 `docker-compose.yml` 的 `environment` 里可调：
+- `CHUNK_SECONDS` / `CHUNK_OVERLAP_SECONDS`：长音频会先切片再转写；如果你感觉段落衔接不顺，可适当增加 `CHUNK_OVERLAP_SECONDS`。
+- `CONTEXT_TAIL_CHARS`：每段转写时追加上一段尾部的上下文（字符数），用于提升跨段连续性；设为 `0` 可关闭。
+- `NORMALIZE_ZH_NUMBERS`：中文数值归一化（例如 `二零二六年 -> 2026年`、`百分之五点五 -> 5.5%`）。

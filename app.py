@@ -12,6 +12,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from qwen_asr import Qwen3ASRModel
 
+from text_normalize import normalize_zh_numbers
+
 app = FastAPI()
 app.mount(
     "/static",
@@ -29,6 +31,8 @@ MAX_CONCURRENT_TRANSCRIBE = int(os.getenv("MAX_CONCURRENT_TRANSCRIBE", "1"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 CHUNK_SECONDS = float(os.getenv("CHUNK_SECONDS", "600"))
 CHUNK_OVERLAP_SECONDS = float(os.getenv("CHUNK_OVERLAP_SECONDS", "1"))
+CONTEXT_TAIL_CHARS = int(os.getenv("CONTEXT_TAIL_CHARS", "200"))
+NORMALIZE_ZH_NUMBERS = (os.getenv("NORMALIZE_ZH_NUMBERS", "1").strip().lower() not in ("0", "false", "no", "off"))
 
 _model = None
 _transcribe_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_TRANSCRIBE))
@@ -183,7 +187,18 @@ def _merge_texts_with_overlap(texts: list[str]) -> str:
         if ol > 0:
             merged += t[ol:]
         else:
-            merged += ("\n" if not merged.endswith("\n") else "") + t
+            if not merged:
+                merged = t
+                continue
+            joiner = ""
+            if merged and not merged.endswith(("\n", "。", "！", "？", "!", "?", "…")) and not t.startswith(("，", "。", "！", "？", ",", ".", "!", "?", "；", ";", "：", ":", "、")):
+                a_last = merged[-1]
+                b_first = t[0]
+                if a_last.isascii() and b_first.isascii() and (a_last.isalnum() or a_last in ("%","/")) and b_first.isalnum():
+                    joiner = " "
+            elif merged and merged.endswith(("。", "！", "？", "!", "?", "…")) and not merged.endswith("\n"):
+                joiner = "\n"
+            merged += joiner + t
     return merged
 
 def _transcribe_path(in_path: str, lang: Optional[str], context: str) -> tuple[str, Optional[str]]:
@@ -195,12 +210,29 @@ def _transcribe_path(in_path: str, lang: Optional[str], context: str) -> tuple[s
 
         texts: list[str] = []
         langs: list[str] = []
+        prev_tail = ""
+        base_context = (context or "").strip()
         for cp in chunk_paths:
-            results = _model.transcribe(audio=cp, context=context, language=lang)
+            chunk_context = base_context
+            if CONTEXT_TAIL_CHARS > 0 and prev_tail:
+                chunk_context = f"{base_context}\n{prev_tail}" if base_context else prev_tail
+
+            results = _model.transcribe(audio=cp, context=chunk_context, language=lang)
+            chunk_text = ""
             if results:
-                r0 = results[0]
-                texts.append(r0.text)
-                langs.append((getattr(r0, "language", "") or "").strip())
+                seg_texts: list[str] = []
+                for r in results:
+                    rt = (getattr(r, "text", "") or "").strip()
+                    if rt:
+                        seg_texts.append(rt)
+                    rl = (getattr(r, "language", "") or "").strip()
+                    if rl:
+                        langs.append(rl)
+                chunk_text = _merge_texts_with_overlap(seg_texts)
+                if chunk_text:
+                    texts.append(chunk_text)
+            if CONTEXT_TAIL_CHARS > 0:
+                prev_tail = chunk_text[-CONTEXT_TAIL_CHARS:] if chunk_text else ""
             try:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -208,6 +240,8 @@ def _transcribe_path(in_path: str, lang: Optional[str], context: str) -> tuple[s
                 pass
 
         merged_text = _merge_texts_with_overlap(texts)
+        if NORMALIZE_ZH_NUMBERS and merged_text:
+            merged_text = normalize_zh_numbers(merged_text)
         merged_lang = lang
         if not merged_lang:
             uniq = [x for x in dict.fromkeys([x for x in langs if x])]
@@ -772,6 +806,8 @@ def health():
         "max_concurrent_transcribe": MAX_CONCURRENT_TRANSCRIBE,
         "chunk_seconds": CHUNK_SECONDS,
         "chunk_overlap_seconds": CHUNK_OVERLAP_SECONDS,
+        "context_tail_chars": CONTEXT_TAIL_CHARS,
+        "normalize_zh_numbers": NORMALIZE_ZH_NUMBERS,
     }
 
 @app.post("/admin/reload")
