@@ -11,5 +11,5 @@ COPY app.py /app/app.py
 COPY text_normalize.py /app/text_normalize.py
 COPY server.py /app/server.py
 COPY static /app/static
-EXPOSE 8000
+EXPOSE 12301
 CMD ["python", "-u", "server.py"]
