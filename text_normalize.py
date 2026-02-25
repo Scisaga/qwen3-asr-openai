@@ -103,6 +103,7 @@ _RE_ZH_YEAR_RANGE = re.compile(
     r"(?P<sep>至|到|—|–|－|-|~|～)"
     r"(?P<b>[零〇一二三四五六七八九]{4})年"
 )
+_RE_ARABIC_ONE_COUNTER = re.compile(r"(?<!\d)1(?P<u>个|年|月|日|天|次|省|市|项|条|位|名|代)")
 
 
 def normalize_zh_numbers(text: str) -> str:
@@ -136,7 +137,10 @@ def normalize_zh_numbers(text: str) -> str:
         return f"{n}%"
 
     def repl_counter(m: re.Match) -> str:
-        n = _zh_num_to_str(m.group("n"))
+        raw = m.group("n")
+        if raw in _ZH_DIGITS and len(raw) == 1:
+            return m.group(0)
+        n = _zh_num_to_str(raw)
         if n is None:
             return m.group(0)
         return f"{n}{m.group('u')}"
@@ -146,4 +150,5 @@ def normalize_zh_numbers(text: str) -> str:
     t = _RE_ZH_PERCENT_RANGE.sub(repl_percent_range, t)
     t = _RE_ZH_PERCENT.sub(repl_percent, t)
     t = _RE_ZH_COUNTER.sub(repl_counter, t)
+    t = _RE_ARABIC_ONE_COUNTER.sub(lambda m: f"一{m.group('u')}", t)
     return t

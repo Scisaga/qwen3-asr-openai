@@ -20,8 +20,9 @@ class TestNormalizeZhNumbers(unittest.TestCase):
 
     def test_counters(self):
         self.assertEqual(normalize_zh_numbers("下调省份多达十九个"), "下调省份多达19个")
-        self.assertEqual(normalize_zh_numbers("连续四年未达标"), "连续4年未达标")
         self.assertEqual(normalize_zh_numbers("七十代到六十代再到五十代"), "70代到60代再到50代")
+        self.assertEqual(normalize_zh_numbers("连续四年未达标"), "连续四年未达标")
+        self.assertEqual(normalize_zh_numbers("1个关键细节"), "一个关键细节")
 
     def test_no_false_positive(self):
         self.assertEqual(normalize_zh_numbers("一刀切式的环保政策"), "一刀切式的环保政策")
@@ -29,4 +30,3 @@ class TestNormalizeZhNumbers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
