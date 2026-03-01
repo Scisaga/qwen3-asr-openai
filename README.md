@@ -5,7 +5,7 @@
 把 Qwen3-ASR 封装成一个可自托管的推理服务：对外提供 OpenAI 兼容的转写接口，内置上传转写页面，并附带 FastAPI 的交互式接口文档，方便在内网/私有环境里快速接入与运维。
 
 项目地址：
-- 代码仓库：`https://scisaga.cc:233/rewind/qwen3-asr-openai`
+- 代码仓库：[`https://github.com/Scisaga/qwen3-asr-openai`](https://github.com/Scisaga/qwen3-asr-openai)
 - 镜像仓库（GHCR）：`ghcr.io/scisaga/qwen3-asr-openai:latest`
 
 ## 功能
