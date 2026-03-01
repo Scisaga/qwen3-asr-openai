@@ -72,4 +72,4 @@ curl -X POST http://localhost:12301/admin/reload \
 - `NORMALIZE_ZH_NUMBERS`：中文数值归一化（例如 `二零二六年 -> 2026年`、`百分之五点五 -> 5.5%`）。
 
 ## License
-MIT License（见 `LICENSE`）。
+Apache 2.0 License（见 `LICENSE`）。
