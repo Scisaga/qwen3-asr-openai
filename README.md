@@ -1,4 +1,4 @@
-# Qwen3-ASR：自托管 ASR 推理服务（OpenAI 兼容 + Web UI + `/docs`）
+# Qwen3-ASR：自托管 ASR 推理服务
 
 ![界面截图](img/README-1772375809320.png)
 
@@ -70,3 +70,6 @@ curl -X POST http://localhost:12301/admin/reload \
 - `CHUNK_SECONDS` / `CHUNK_OVERLAP_SECONDS`：长音频会先切片再转写；如果你感觉段落衔接不顺，可适当增加 `CHUNK_OVERLAP_SECONDS`。
 - `CONTEXT_TAIL_CHARS`：每段转写时追加上一段尾部的上下文（字符数），用于提升跨段连续性；设为 `0` 可关闭。
 - `NORMALIZE_ZH_NUMBERS`：中文数值归一化（例如 `二零二六年 -> 2026年`、`百分之五点五 -> 5.5%`）。
+
+## License
+Apache License 2.0（见 `LICENSE`）。
