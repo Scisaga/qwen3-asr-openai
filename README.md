@@ -79,4 +79,12 @@ curl -X POST http://localhost:12301/admin/reload \
 - `NORMALIZE_ZH_NUMBERS`：中文数值归一化（例如 `二零二六年 -> 2026年`、`百分之五点五 -> 5.5%`）。
 
 ## License
-Apache 2.0 License（见 `LICENSE`）。
+MIT License（见 `LICENSE`）。
+
+## GitHub Actions：自动构建并发布镜像
+项目已内置工作流：推送到 `main` 或打 tag（如 `v1.0.0`）后，会自动构建 Docker 镜像并发布到 GitHub Container Registry（GHCR）。
+
+- 镜像地址：`ghcr.io/<owner>/<repo>:latest`
+- 工作流文件：`.github/workflows/docker-publish.yml`
+
+注意：仓库需要允许 Actions 推送 Packages（一般保持默认即可）；如需公开拉取镜像，请在 GitHub Packages 中将该镜像设为 Public。

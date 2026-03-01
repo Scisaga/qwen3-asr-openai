@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.git/
+.github/
+models/
+img/
+test_*.py
+README.md
+LICENSE
