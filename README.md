@@ -6,7 +6,7 @@
 
 项目地址：
 - 代码仓库：`https://scisaga.cc:233/rewind/qwen3-asr-openai`
-- 镜像仓库（GHCR）：`ghcr.io/<owner>/<repo>:latest`（按你的 GitHub 仓库名替换）
+- 镜像仓库（GHCR）：`ghcr.io/scisaga/qwen3-asr-openai:latest`
 
 ## 功能
 - OpenAI 兼容转写接口：`POST /v1/audio/transcriptions`（可直接复用现有 OpenAI SDK/调用逻辑）
@@ -22,15 +22,6 @@
 docker compose up -d --build
 ```
 
-说明：容器启动时会自动下载并加载模型（首次启动可能需要较长时间）；模型就绪后才会开始对外提供 HTTP 服务。建议使用 GPU；如需 CPU 推理，将 `DTYPE` 改为 `float32` 并确保 `DEVICE_MAP` 配置合理（性能会显著下降）。
-
-## 资源需求（参考）
-显存/内存占用与模型大小、`DTYPE`、`MAX_BATCH`、`MAX_NEW_TOKENS`、音频长度/切片参数（`CHUNK_SECONDS`）等强相关。下面给一个“算例级”的参考口径，方便你评估机器规格（以实际运行数据为准）：
-
-- **模型加载显存**：`Qwen/Qwen3-ASR-1.7B` + `DTYPE=bfloat16`（单卡）加载后显存占用约 **5.086 GiB**（示例值；不同驱动/框架版本会有波动）。
-- **推理时额外占用**：转写过程中会在模型常驻显存之外额外分配工作区/缓存；长音频、较大的 `MAX_NEW_TOKENS` 或更高并发会明显抬升峰值显存。
-- **如何查看**：在宿主机执行 `nvidia-smi`（或 `nvidia-smi -l 1` 观察峰值）；也可以先启动服务，等模型加载完成后再看“常驻占用”。
-
 如果机器需要走代理才能访问 HuggingFace，可在同目录创建 `.env`（或启动前导出环境变量）：
 ```bash
 HTTP_PROXY=http://127.0.0.1:7890
@@ -44,8 +35,13 @@ HTTP_PROXY=http://127.0.0.1:7890
 - 接口文档（ReDoc）：http://localhost:12301/redoc
 - 健康检查：http://localhost:12301/health
 
+## 资源需求
+
+- **模型加载显存**：`Qwen/Qwen3-ASR-1.7B` + `DTYPE=bfloat16`（单卡）加载后显存占用约 **5.086 GiB**（示例值；不同驱动/框架版本会有波动）。
+- **推理时额外占用**：转写过程中会在模型常驻显存之外额外分配工作区/缓存；长音频、较大的 `MAX_NEW_TOKENS` 或更高并发会明显抬升峰值显存。
+- **如何查看**：在宿主机执行 `nvidia-smi`（或 `nvidia-smi -l 1` 观察峰值）；也可以先启动服务，等模型加载完成后再看“常驻占用”。
+
 ## Docker 部署示例
-**方式 1：直接运行（推荐用于快速验证）**
 ```bash
 docker run -d --name qwen3_asr_openai \
   --gpus all \
@@ -55,35 +51,7 @@ docker run -d --name qwen3_asr_openai \
   -e DTYPE="bfloat16" \
   -e HF_HOME="/models" \
   -v ./models:/models \
-  ghcr.io/<owner>/<repo>:latest
-```
-
-**方式 2：Docker Compose（适合长期部署/参数管理）**
-```yaml
-services:
-  qwen3_asr:
-    image: ghcr.io/<owner>/<repo>:latest
-    container_name: qwen3_asr_openai
-    restart: unless-stopped
-    ports:
-      - "12301:12301"
-    environment:
-      MODEL_ID: "Qwen/Qwen3-ASR-1.7B"
-      DEVICE_MAP: "cuda:0"
-      DTYPE: "bfloat16"
-      MAX_NEW_TOKENS: "512"
-      MAX_BATCH: "1"
-      HF_HOME: "/models"
-      PORT: "12301"
-    volumes:
-      - ./models:/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+  ghcr.io/scisaga/qwen3-asr-openai:latest
 ```
 
 ## 接口一览
@@ -126,11 +94,3 @@ curl -X POST http://localhost:12301/admin/reload \
 
 ## License
 MIT License（见 `LICENSE`）。
-
-## GitHub Actions：自动构建并发布镜像
-项目已内置工作流：推送到 `main` 或打 tag（如 `v1.0.0`）后，会自动构建 Docker 镜像并发布到 GitHub Container Registry（GHCR）。
-
-- 镜像地址：`ghcr.io/<owner>/<repo>:latest`
-- 工作流文件：`.github/workflows/docker-publish.yml`
-
-注意：仓库需要允许 Actions 推送 Packages（一般保持默认即可）；如需公开拉取镜像，请在 GitHub Packages 中将该镜像设为 Public。
