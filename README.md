@@ -1,18 +1,24 @@
-# Qwen3-ASR：OpenAI 兼容接口 + Web 上传界面（极简）
+# Qwen3-ASR：自托管 ASR 推理服务（OpenAI 兼容 + Web UI + `/docs`）
+
+![界面截图](img/README-1772375809320.png)
+
+把 Qwen3-ASR 封装成一个可自托管的推理服务：对外提供 OpenAI 兼容的转写接口，内置上传转写页面，并附带 FastAPI 的交互式接口文档，方便在内网/私有环境里快速接入与运维。
 
 ## 功能
-- OpenAI 兼容接口：`POST /v1/audio/transcriptions`
-- 内置文件上传 Web UI：`GET /`
-- 通过 HuggingFace 缓存自动下载模型（将 `./models` 挂载到 `/models`）
-- 支持音频/视频输入；使用 ffmpeg 抽取音频并转换为 16k 单声道 wav
-- 可选模型热重载：`POST /admin/reload`（由 `ADMIN_TOKEN` 保护）
+- OpenAI 兼容转写接口：`POST /v1/audio/transcriptions`（可直接复用现有 OpenAI SDK/调用逻辑）
+- 内置 Web UI：`GET /`（上传音频/视频即可转写）
+- 交互式接口文档：`GET /docs`（Swagger UI）与 `GET /redoc`
+- 模型自动下载与缓存：将 `./models` 挂载到容器 `/models`（HuggingFace 缓存目录）
+- 音频/视频输入：用 ffmpeg 抽取音轨并转换为 16k 单声道 wav
+- 运维友好：健康检查 `GET /health`；可选热重载 `POST /admin/reload`（`ADMIN_TOKEN` 保护）
+- 文本后处理：中文数值归一化（可开关），更适合直接生成可读稿件
 
 ## 快速开始
 ```bash
 docker compose up -d --build
 ```
 
-说明：容器启动时会自动下载并加载模型（首次启动可能需要较长时间）；模型就绪后才会开始对外提供 HTTP 服务。
+说明：容器启动时会自动下载并加载模型（首次启动可能需要较长时间）；模型就绪后才会开始对外提供 HTTP 服务。建议使用 GPU；如需 CPU 推理，将 `DTYPE` 改为 `float32` 并确保 `DEVICE_MAP` 配置合理（性能会显著下降）。
 
 如果机器需要走代理才能访问 HuggingFace，可在同目录创建 `.env`（或启动前导出环境变量）：
 ```bash
@@ -23,7 +29,17 @@ HTTP_PROXY=http://127.0.0.1:7890
 
 打开：
 - Web UI：http://localhost:12301/
+- 接口文档（Swagger）：http://localhost:12301/docs
+- 接口文档（ReDoc）：http://localhost:12301/redoc
 - 健康检查：http://localhost:12301/health
+
+## 接口一览
+- `POST /v1/audio/transcriptions`
+  - 表单字段：`file`（必填）、`language`（可选，`zh/en` 等）、`prompt`（可选，上下文/专有名词）、`temperature`（可选）
+- `GET /docs` / `GET /redoc`：交互式接口文档（也可用于查看 `curl` 示例与 OpenAPI schema）
+- `GET /openapi.json`：OpenAPI 规范 JSON
+- `GET /health`：健康检查与运行参数（切片、后处理开关等）
+- `POST /admin/reload`：热重载模型（需 `x-admin-token`）
 
 ## 切换模型（需重启）
 在 `docker-compose.yml` 中修改 `MODEL_ID`，然后：
