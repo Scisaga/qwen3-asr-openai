@@ -4,6 +4,10 @@
 
 把 Qwen3-ASR 封装成一个可自托管的推理服务：对外提供 OpenAI 兼容的转写接口，内置上传转写页面，并附带 FastAPI 的交互式接口文档，方便在内网/私有环境里快速接入与运维。
 
+项目地址：
+- 代码仓库：`https://scisaga.cc:233/rewind/qwen3-asr-openai`
+- 镜像仓库（GHCR）：`ghcr.io/<owner>/<repo>:latest`（按你的 GitHub 仓库名替换）
+
 ## 功能
 - OpenAI 兼容转写接口：`POST /v1/audio/transcriptions`（可直接复用现有 OpenAI SDK/调用逻辑）
 - 内置 Web UI：`GET /`（上传音频/视频即可转写）
@@ -39,6 +43,48 @@ HTTP_PROXY=http://127.0.0.1:7890
 - 接口文档（Swagger）：http://localhost:12301/docs
 - 接口文档（ReDoc）：http://localhost:12301/redoc
 - 健康检查：http://localhost:12301/health
+
+## Docker 部署示例
+**方式 1：直接运行（推荐用于快速验证）**
+```bash
+docker run -d --name qwen3_asr_openai \
+  --gpus all \
+  -p 12301:12301 \
+  -e MODEL_ID="Qwen/Qwen3-ASR-1.7B" \
+  -e DEVICE_MAP="cuda:0" \
+  -e DTYPE="bfloat16" \
+  -e HF_HOME="/models" \
+  -v ./models:/models \
+  ghcr.io/<owner>/<repo>:latest
+```
+
+**方式 2：Docker Compose（适合长期部署/参数管理）**
+```yaml
+services:
+  qwen3_asr:
+    image: ghcr.io/<owner>/<repo>:latest
+    container_name: qwen3_asr_openai
+    restart: unless-stopped
+    ports:
+      - "12301:12301"
+    environment:
+      MODEL_ID: "Qwen/Qwen3-ASR-1.7B"
+      DEVICE_MAP: "cuda:0"
+      DTYPE: "bfloat16"
+      MAX_NEW_TOKENS: "512"
+      MAX_BATCH: "1"
+      HF_HOME: "/models"
+      PORT: "12301"
+    volumes:
+      - ./models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+```
 
 ## 接口一览
 - `POST /v1/audio/transcriptions`
