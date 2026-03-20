@@ -2,7 +2,7 @@
 
 ![界面截图](img/README-1772375809320.png)
 
-把 Qwen3-ASR 封装成一个可自托管的推理服务：对外提供 OpenAI 兼容的转写接口，内置上传转写页面，并附带 FastAPI 的交互式接口文档，方便在内网/私有环境里快速接入与运维。
+把 Qwen3-ASR 封装成一个可自托管的推理服务：对外提供 OpenAI 兼容的转写接口、HTTP MCP Server、内置上传转写页面，并附带 FastAPI 的交互式接口文档，方便在内网/私有环境里快速接入与运维。
 
 项目地址：
 - 代码仓库：[`https://github.com/Scisaga/qwen3-asr-openai`](https://github.com/Scisaga/qwen3-asr-openai)
@@ -10,6 +10,7 @@
 
 ## 功能
 - OpenAI 兼容转写接口：`POST /v1/audio/transcriptions`（可直接复用现有 OpenAI SDK/调用逻辑）
+- MCP Server：HTTP 挂载到 `POST/GET /mcp`（Streamable HTTP）
 - 内置 Web UI：`GET /`（上传音频/视频即可转写）
 - 交互式接口文档：`GET /docs`（Swagger UI）与 `GET /redoc`
 - 模型自动下载与缓存：将 `./models` 挂载到容器 `/models`（HuggingFace 缓存目录）
@@ -31,9 +32,43 @@ HTTP_PROXY=http://127.0.0.1:7890
 
 打开：
 - Web UI：http://localhost:12301/
+- MCP HTTP：http://localhost:12301/mcp
 - 接口文档（Swagger）：http://localhost:12301/docs
 - 接口文档（ReDoc）：http://localhost:12301/redoc
 - 健康检查：http://localhost:12301/health
+
+## MCP 快速开始
+
+### HTTP MCP
+服务启动后，MCP Streamable HTTP 入口固定为：
+
+```text
+http://localhost:12301/mcp
+```
+
+适合远端客户端或通过网关统一接入的场景。
+
+## MCP 能力一览
+
+### Tool
+- `transcribe_audio`
+  - 入参：`audio_base64`（必填）、`filename`（可选）、`mime_type`（可选）、`language`（可选）、`prompt`（可选）
+  - 返回：`{"text": "...", "language": "Chinese"}`
+
+### Resources
+- `qwen3asr://health`：当前模型、device、dtype、并发与切片参数
+- `qwen3asr://usage`：MCP 工具参数说明、返回格式、大小限制与推荐用法
+
+### Prompts
+- `transcribe_audio_workflow`：指导客户端何时以及如何调用 `transcribe_audio`
+- `transcript_cleanup_workflow`：指导客户端在转写后进行分段、整理、摘要时保持事实不变
+
+## MCP 输入限制
+
+- MCP 首版只支持 `audio_base64`，不支持 `multipart/form-data`、`audio_url`、本地路径或 `file://` URI。
+- `audio_base64` 支持直接传 base64 字符串，也支持 `data:*;base64,...` 形式。
+- 默认大小限制由 `MCP_MAX_INPUT_BYTES` 控制，默认值为 `33554432`（32 MiB，按解码后的原始字节数计算）。
+- 由于 base64 不适合长音频/大视频，较大文件建议继续使用 `POST /v1/audio/transcriptions` 上传。
 
 ## 资源需求
 
@@ -57,6 +92,7 @@ docker run -d --name qwen3_asr_openai \
 ## 接口一览
 - `POST /v1/audio/transcriptions`
   - 表单字段：`file`（必填）、`language`（可选，`zh/en` 等）、`prompt`（可选，上下文/专有名词）、`temperature`（可选）
+- `POST /mcp` / `GET /mcp`：MCP Streamable HTTP 入口
 - `GET /docs` / `GET /redoc`：交互式接口文档（也可用于查看 `curl` 示例与 OpenAPI schema）
 - `GET /openapi.json`：OpenAPI 规范 JSON
 - `GET /health`：健康检查与运行参数（切片、后处理开关等）
@@ -91,6 +127,7 @@ curl -X POST http://localhost:12301/admin/reload \
 - `CHUNK_SECONDS` / `CHUNK_OVERLAP_SECONDS`：长音频会先切片再转写；如果你感觉段落衔接不顺，可适当增加 `CHUNK_OVERLAP_SECONDS`。
 - `CONTEXT_TAIL_CHARS`：每段转写时追加上一段尾部的上下文（字符数），用于提升跨段连续性；设为 `0` 可关闭。
 - `NORMALIZE_ZH_NUMBERS`：中文数值归一化（例如 `二零二六年 -> 2026年`、`百分之五点五 -> 5.5%`）。
+- `MCP_MAX_INPUT_BYTES`：MCP `audio_base64` 的解码后字节上限；大文件建议改走 HTTP 上传接口。
 
 ## License
 MIT License（见 `LICENSE`）。

@@ -8,6 +8,8 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app.py /app/app.py
+COPY mcp_server.py /app/mcp_server.py
+COPY transcription_service.py /app/transcription_service.py
 COPY text_normalize.py /app/text_normalize.py
 COPY server.py /app/server.py
 COPY static /app/static

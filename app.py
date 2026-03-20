@@ -1,260 +1,36 @@
-import asyncio
+import contextlib
 import os
-import math
-import shutil
-import tempfile
-import subprocess
 from typing import Optional
 
-import torch
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from qwen_asr import Qwen3ASRModel
 
-from text_normalize import normalize_zh_numbers
+from mcp_server import mcp
+from transcription_service import (
+    ADMIN_TOKEN,
+    BackendTranscriptionError,
+    CudaOOMTranscriptionError,
+    get_health_payload,
+    guess_audio_suffix,
+    load_model,
+    transcribe_input_bytes,
+)
 
-app = FastAPI()
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with mcp.session_manager.run():
+        yield
+
+
+app = FastAPI(lifespan=lifespan)
 app.mount(
     "/static",
     StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")),
     name="static",
 )
-
-MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen3-ASR-1.7B")
-MODEL_REVISION = os.getenv("MODEL_REVISION")  # optional
-DEVICE_MAP = os.getenv("DEVICE_MAP", "cuda:0")
-DTYPE = os.getenv("DTYPE", "bfloat16")
-MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "512"))
-MAX_BATCH = int(os.getenv("MAX_BATCH", "1"))
-MAX_CONCURRENT_TRANSCRIBE = int(os.getenv("MAX_CONCURRENT_TRANSCRIBE", "1"))
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-CHUNK_SECONDS = float(os.getenv("CHUNK_SECONDS", "600"))
-CHUNK_OVERLAP_SECONDS = float(os.getenv("CHUNK_OVERLAP_SECONDS", "1"))
-CONTEXT_TAIL_CHARS = int(os.getenv("CONTEXT_TAIL_CHARS", "200"))
-NORMALIZE_ZH_NUMBERS = (os.getenv("NORMALIZE_ZH_NUMBERS", "1").strip().lower() not in ("0", "false", "no", "off"))
-
-_model = None
-_transcribe_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_TRANSCRIBE))
-
-def _torch_dtype(dtype_str: str):
-    s = (dtype_str or "").lower()
-    if s in ("bf16", "bfloat16"):
-        return torch.bfloat16
-    if s in ("fp16", "float16"):
-        return torch.float16
-    return torch.float32
-
-def _load_model(model_id: str, revision: Optional[str] = None):
-    global _model
-    kwargs = dict(
-        torch_dtype=_torch_dtype(DTYPE),
-        device_map=DEVICE_MAP,
-        max_inference_batch_size=MAX_BATCH,
-        max_new_tokens=MAX_NEW_TOKENS,
-    )
-    if revision:
-        kwargs["revision"] = revision
-    _model = Qwen3ASRModel.from_pretrained(model_id, **kwargs)
-
-def _ensure_model():
-    global _model
-    if _model is None:
-        _load_model(MODEL_ID, MODEL_REVISION)
-
-def _map_language(lang: Optional[str]) -> Optional[str]:
-    if not lang:
-        return None
-    l = lang.strip().lower()
-    if l in ("zh", "zh-cn", "zh_cn", "chinese", "中文"):
-        return "Chinese"
-    if l in ("en", "english", "英文"):
-        return "English"
-    return lang
-
-def _to_wav16k_mono(input_path: str) -> str:
-    out_path = tempfile.mktemp(suffix=".wav")
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-ac", "1", "-ar", "16000",
-        "-vn",
-        out_path
-    ]
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if p.returncode != 0:
-        raise RuntimeError(p.stderr.decode("utf-8", errors="ignore")[-2000:])
-    return out_path
-
-def _ffprobe_duration_seconds(path: str) -> Optional[float]:
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=nk=1:nw=1",
-        path,
-    ]
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        return None
-    try:
-        v = float((p.stdout or "").strip())
-        if math.isfinite(v) and v > 0:
-            return v
-    except Exception:
-        return None
-    return None
-
-def _extract_wav_segment(input_wav: str, start_s: float, duration_s: float, out_wav: str) -> None:
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-ss",
-        f"{start_s:.3f}",
-        "-t",
-        f"{duration_s:.3f}",
-        "-i",
-        input_wav,
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-vn",
-        out_wav,
-    ]
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if p.returncode != 0:
-        raise RuntimeError(p.stderr.decode("utf-8", errors="ignore")[-2000:])
-
-def _split_wav_with_overlap(input_wav: str, chunk_s: float, overlap_s: float) -> tuple[list[str], str]:
-    duration_s = _ffprobe_duration_seconds(input_wav)
-    if not duration_s:
-        return ([input_wav], "")
-
-    chunk_s = float(chunk_s)
-    overlap_s = float(overlap_s)
-    if chunk_s <= 0 or overlap_s < 0 or chunk_s <= overlap_s:
-        return ([input_wav], "")
-
-    if duration_s <= chunk_s + 0.25:
-        return ([input_wav], "")
-
-    stride_s = chunk_s - overlap_s
-    out_dir = tempfile.mkdtemp(prefix="qwen3asr_chunks_")
-    chunks: list[str] = []
-
-    start = 0.0
-    idx = 0
-    while start < duration_s - 0.05:
-        seg_dur = min(chunk_s, max(0.0, duration_s - start))
-        if seg_dur <= 0.05:
-            break
-        out_path = os.path.join(out_dir, f"chunk_{idx:06d}.wav")
-        _extract_wav_segment(input_wav, start, seg_dur, out_path)
-        chunks.append(out_path)
-        idx += 1
-        start += stride_s
-
-    if not chunks:
-        shutil.rmtree(out_dir, ignore_errors=True)
-        return ([input_wav], "")
-
-    return (chunks, out_dir)
-
-def _max_overlap_suffix_prefix(a: str, b: str, max_len: int = 160) -> int:
-    if not a or not b:
-        return 0
-    a_tail = a[-max_len:]
-    b_head = b[:max_len]
-    max_l = min(len(a_tail), len(b_head))
-    for l in range(max_l, 10, -1):
-        if a_tail[-l:] == b_head[:l]:
-            return l
-    return 0
-
-def _merge_texts_with_overlap(texts: list[str]) -> str:
-    merged = ""
-    for t in texts:
-        t = (t or "").strip()
-        if not t:
-            continue
-        if not merged:
-            merged = t
-            continue
-        ol = _max_overlap_suffix_prefix(merged, t)
-        if ol > 0:
-            merged += t[ol:]
-        else:
-            if not merged:
-                merged = t
-                continue
-            joiner = ""
-            if merged and not merged.endswith(("\n", "。", "！", "？", "!", "?", "…")) and not t.startswith(("，", "。", "！", "？", ",", ".", "!", "?", "；", ";", "：", ":", "、")):
-                a_last = merged[-1]
-                b_first = t[0]
-                if a_last.isascii() and b_first.isascii() and (a_last.isalnum() or a_last in ("%","/")) and b_first.isalnum():
-                    joiner = " "
-            elif merged and merged.endswith(("。", "！", "？", "!", "?", "…")) and not merged.endswith("\n"):
-                joiner = "\n"
-            merged += joiner + t
-    return merged
-
-def _transcribe_path(in_path: str, lang: Optional[str], context: str) -> tuple[str, Optional[str]]:
-    wav_path = None
-    chunk_dir = ""
-    try:
-        wav_path = _to_wav16k_mono(in_path)
-        chunk_paths, chunk_dir = _split_wav_with_overlap(wav_path, CHUNK_SECONDS, CHUNK_OVERLAP_SECONDS)
-
-        texts: list[str] = []
-        langs: list[str] = []
-        prev_tail = ""
-        base_context = (context or "").strip()
-        for cp in chunk_paths:
-            chunk_context = base_context
-            if CONTEXT_TAIL_CHARS > 0 and prev_tail:
-                chunk_context = f"{base_context}\n{prev_tail}" if base_context else prev_tail
-
-            results = _model.transcribe(audio=cp, context=chunk_context, language=lang)
-            chunk_text = ""
-            if results:
-                seg_texts: list[str] = []
-                for r in results:
-                    rt = (getattr(r, "text", "") or "").strip()
-                    if rt:
-                        seg_texts.append(rt)
-                    rl = (getattr(r, "language", "") or "").strip()
-                    if rl:
-                        langs.append(rl)
-                chunk_text = _merge_texts_with_overlap(seg_texts)
-                if chunk_text:
-                    texts.append(chunk_text)
-            if CONTEXT_TAIL_CHARS > 0:
-                prev_tail = chunk_text[-CONTEXT_TAIL_CHARS:] if chunk_text else ""
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-        merged_text = _merge_texts_with_overlap(texts)
-        if NORMALIZE_ZH_NUMBERS and merged_text:
-            merged_text = normalize_zh_numbers(merged_text)
-        merged_lang = lang
-        if not merged_lang:
-            uniq = [x for x in dict.fromkeys([x for x in langs if x])]
-            merged_lang = ",".join(uniq) if uniq else None
-        return (merged_text, merged_lang)
-    finally:
-        if wav_path and os.path.exists(wav_path):
-            try:
-                os.remove(wav_path)
-            except Exception:
-                pass
-        if chunk_dir:
-            shutil.rmtree(chunk_dir, ignore_errors=True)
+app.mount("/mcp", mcp.streamable_http_app(), name="mcp")
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -796,19 +572,7 @@ def index():
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "model_loaded": _model is not None,
-        "model_id": MODEL_ID,
-        "revision": MODEL_REVISION,
-        "device_map": DEVICE_MAP,
-        "dtype": DTYPE,
-        "max_concurrent_transcribe": MAX_CONCURRENT_TRANSCRIBE,
-        "chunk_seconds": CHUNK_SECONDS,
-        "chunk_overlap_seconds": CHUNK_OVERLAP_SECONDS,
-        "context_tail_chars": CONTEXT_TAIL_CHARS,
-        "normalize_zh_numbers": NORMALIZE_ZH_NUMBERS,
-    }
+    return get_health_payload()
 
 @app.post("/admin/reload")
 async def admin_reload(request: Request):
@@ -816,9 +580,10 @@ async def admin_reload(request: Request):
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
     body = await request.json()
-    model_id = body.get("model_id", MODEL_ID)
-    revision = body.get("revision", MODEL_REVISION)
-    _load_model(model_id, revision)
+    current_health = get_health_payload()
+    model_id = body.get("model_id", current_health["model_id"])
+    revision = body.get("revision", current_health["revision"])
+    load_model(model_id, revision)
     return {"status": "reloaded", "model_id": model_id, "revision": revision}
 
 @app.post("/v1/audio/transcriptions")
@@ -828,51 +593,25 @@ async def transcriptions(
     prompt: Optional[str] = Form(None),
     temperature: Optional[float] = Form(None),
 ):
-    _ensure_model()
+    del temperature
 
-    suffix = os.path.splitext(file.filename or "")[1] or ".bin"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
-        in_path = tmp.name
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="empty file")
 
-    lang = _map_language(language)
-    context = (prompt or "").strip()
     try:
-        try:
-            async with _transcribe_sem:
-                merged_text, merged_lang = await asyncio.to_thread(_transcribe_path, in_path, lang, context)
-        except torch.cuda.OutOfMemoryError as e:
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-            except Exception:
-                pass
-            raise HTTPException(
-                status_code=507,
-                detail={
-                    "error": "cuda_oom",
-                    "message": "CUDA 显存不足：当前模型/输入在推理时超出 GPU 可用显存。",
-                    "tips": [
-                        "将 MAX_BATCH 调小（建议 1）",
-                        "将 MAX_NEW_TOKENS 调小（如 128/256）",
-                        "换更小模型（如 Qwen/Qwen3-ASR-0.6B）或使用更多 GPU",
-                        "超长音频/视频建议先截短或分段再转写",
-                        "可尝试设置 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True（缓解显存碎片/保留块）",
-                    ],
-                    "exception": str(e),
-                },
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail={"error": "transcribe_failed", "exception": str(e)})
+        result = await transcribe_input_bytes(
+            payload,
+            suffix=guess_audio_suffix(file.filename, file.content_type),
+            language=language,
+            prompt=prompt,
+        )
+    except CudaOOMTranscriptionError as exc:
+        raise HTTPException(status_code=507, detail=exc.detail) from exc
+    except BackendTranscriptionError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "transcribe_failed", "exception": str(exc)},
+        ) from exc
 
-        return JSONResponse({
-            "text": merged_text,
-            "language": merged_lang,
-        })
-    finally:
-        if in_path and os.path.exists(in_path):
-            try:
-                os.remove(in_path)
-            except Exception:
-                pass
+    return JSONResponse(result)

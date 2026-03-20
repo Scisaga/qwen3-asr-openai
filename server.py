@@ -2,7 +2,8 @@ import os
 
 import uvicorn
 
-from app import MODEL_ID, MODEL_REVISION, app, _load_model
+from app import app
+from transcription_service import MODEL_ID, MODEL_REVISION, load_model
 
 
 def _env_flag(name: str, default: str = "1") -> bool:
@@ -37,7 +38,7 @@ def main() -> None:
 
     if preload_model:
         print(f"[startup] Preloading model: {MODEL_ID} (revision={MODEL_REVISION!r})")
-        _load_model(MODEL_ID, MODEL_REVISION)
+        load_model(MODEL_ID, MODEL_REVISION)
         print("[startup] Model ready; starting HTTP server...")
     else:
         print("[startup] PRELOAD_MODEL=0; starting HTTP server without preloading...")
