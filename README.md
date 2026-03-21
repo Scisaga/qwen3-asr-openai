@@ -1,7 +1,5 @@
 # Qwen3-ASR：自托管 ASR 推理服务
 
-![界面截图](img/README-1772375809320.png)
-
 把 Qwen3-ASR 封装成一个可自托管的推理服务：对外提供 OpenAI 兼容的转写接口、HTTP MCP Server、内置上传转写页面，并附带 FastAPI 的交互式接口文档，方便在内网/私有环境里快速接入与运维。
 
 项目地址：
@@ -17,6 +15,8 @@
 - 音频/视频输入：用 ffmpeg 抽取音轨并转换为 16k 单声道 wav
 - 运维友好：健康检查 `GET /health`；可选热重载 `POST /admin/reload`（`ADMIN_TOKEN` 保护）
 - 文本后处理：中文数值归一化（可开关），更适合直接生成可读稿件
+
+![控制台界面](img/README-1774106121505.png)
 
 ## 快速开始
 ```bash
