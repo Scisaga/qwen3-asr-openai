@@ -309,6 +309,38 @@ def index():
       padding:12px;
       overflow:auto;
     }
+    .stack{display:flex; flex-direction:column; gap:12px}
+    .info-grid{
+      display:grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap:12px;
+      margin-top:12px;
+    }
+    .info-box{
+      border:1px solid var(--border);
+      background:rgba(2,6,23,.24);
+      border-radius:14px;
+      padding:12px;
+    }
+    .info-box .label{
+      display:block;
+      margin-bottom:8px;
+    }
+    .plain-list{
+      margin:0;
+      padding-left:18px;
+      color:var(--muted);
+      font-size:13px;
+      line-height:1.7;
+    }
+    .plain-list li + li{margin-top:4px}
+    .note{
+      border-left:3px solid rgba(96,165,250,.38);
+      padding-left:12px;
+      color:var(--muted);
+      font-size:13px;
+      line-height:1.7;
+    }
     .small{font-size:12px; margin-top:10px}
 
     @media (max-width: 980px){
@@ -336,12 +368,14 @@ def index():
 
       <nav class="nav" aria-label="导航">
         <a class="active" href="#upload"><span class="dot" aria-hidden="true"></span> 转写</a>
+        <a href="#mcp"><span class="dot" aria-hidden="true"></span> MCP 说明</a>
         <a href="/docs" target="_blank" rel="noreferrer"><span class="dot" aria-hidden="true"></span> API 文档</a>
         <a href="/health" target="_blank" rel="noreferrer"><span class="dot" aria-hidden="true"></span> 健康检查</a>
       </nav>
 
       <div class="sidebar-footer" aria-label="运行信息">
         <div class="kv"><span class="k">Endpoint</span><span class="v">/v1/audio/transcriptions</span></div>
+        <div class="kv"><span class="k">MCP</span><span class="v">/mcp</span></div>
         <div class="kv"><span class="k">Model</span><span class="v" id="model_id">—</span></div>
         <div class="kv"><span class="k">Device</span><span class="v" id="device_map">—</span></div>
         <div class="kv"><span class="k">DType</span><span class="v" id="dtype">—</span></div>
@@ -434,6 +468,62 @@ def index():
                 <div class="muted small">提示：也可以直接打开 <a href="/docs" target="_blank" rel="noreferrer" class="muted">/docs</a> 使用 Swagger 调用。</div>
               </div>
             </div>
+
+            <div class="card" id="mcp" style="grid-column: 1 / -1;">
+              <div class="card-header">
+                <div class="card-title">MCP 接入说明</div>
+                <span class="muted2" style="font-size:12px;">Streamable HTTP <code>/mcp</code></span>
+              </div>
+              <div class="card-body">
+                <div class="stack">
+                  <div class="note">
+                    当客户端支持 MCP 时，优先通过 <code>/mcp</code> 暴露的 Streamable HTTP 接入；
+                    如果是大文件上传或只需要简单 HTTP 表单调用，继续使用 <code>/v1/audio/transcriptions</code>。
+                  </div>
+
+                  <div class="info-grid">
+                    <div class="info-box">
+                      <span class="label">入口地址</span>
+                      <code>http://localhost:12301/mcp</code>
+                    </div>
+                    <div class="info-box">
+                      <span class="label">可用 Tool</span>
+                      <code>transcribe_audio</code>
+                    </div>
+                    <div class="info-box">
+                      <span class="label">输入上限</span>
+                      <span class="muted"><span id="mcp_limit">检查中...</span>（按 base64 解码后的原始字节）</span>
+                    </div>
+                  </div>
+
+                  <div class="info-grid">
+                    <div class="info-box">
+                      <span class="label">Tool 参数</span>
+                      <ul class="plain-list">
+                        <li><code>audio_base64</code>：必填，支持纯 base64 或 data URL</li>
+                        <li><code>filename</code>：可选，用于推断临时文件后缀</li>
+                        <li><code>mime_type</code>：可选，如 <code>audio/mpeg</code>、<code>video/mp4</code></li>
+                        <li><code>language</code>、<code>prompt</code>：语种与上下文提示</li>
+                      </ul>
+                    </div>
+                    <div class="info-box">
+                      <span class="label">可读资源</span>
+                      <ul class="plain-list">
+                        <li><code>qwen3asr://health</code>：模型、device、dtype、切片参数</li>
+                        <li><code>qwen3asr://usage</code>：MCP 调用说明与返回格式</li>
+                        <li><code>transcribe_audio_workflow</code>：转写调用提示词</li>
+                        <li><code>transcript_cleanup_workflow</code>：整理转写文本提示词</li>
+                      </ul>
+                    </div>
+                  </div>
+
+                  <div class="code">
+                    <code>{"method":"tools/call","params":{"name":"transcribe_audio","arguments":{"audio_base64":"data:audio/mp3;base64,...","filename":"audio.mp3","language":"zh"}}}</code>
+                  </div>
+                  <div class="muted small">提示：MCP 更适合 Agent / IDE / 桌面客户端接入；超大音频或视频文件建议走 HTTP 上传接口，避免 base64 体积膨胀。</div>
+                </div>
+              </div>
+            </div>
           </div>
         </section>
       </main>
@@ -470,11 +560,13 @@ def index():
         document.getElementById('model_id').textContent = j.model_id || '—';
         document.getElementById('device_map').textContent = j.device_map || '—';
         document.getElementById('dtype').textContent = j.dtype || '—';
+        document.getElementById('mcp_limit').textContent = j.mcp_max_input_bytes ? humanSize(j.mcp_max_input_bytes) : '—';
         const loaded = !!j.model_loaded;
         chip.textContent = loaded ? 'Model: loaded' : 'Model: not loaded';
         chip.classList.toggle('ok', loaded);
         chip.classList.toggle('warn', !loaded);
       }catch(e){
+        document.getElementById('mcp_limit').textContent = '不可用';
         chip.textContent = 'Health: unavailable';
         chip.classList.remove('ok');
         chip.classList.add('warn');
