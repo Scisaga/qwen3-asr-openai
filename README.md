@@ -28,6 +28,9 @@ docker compose up -d --build
 HTTP_PROXY=http://127.0.0.1:7890
 # 可选：不走代理的地址（默认：localhost,127.0.0.1）
 # NO_PROXY=localhost,127.0.0.1
+
+# 可选：构建阶段 pip 源（网络不稳时建议设置）
+# PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 打开：

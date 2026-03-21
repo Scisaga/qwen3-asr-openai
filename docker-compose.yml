@@ -1,6 +1,9 @@
 services:
   qwen3_asr:
-    build: .
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
     container_name: qwen3_asr_openai
     restart: unless-stopped
     ports:
