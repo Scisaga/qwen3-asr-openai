@@ -16,7 +16,7 @@
 - 运维友好：健康检查 `GET /health`；可选热重载 `POST /admin/reload`（`ADMIN_TOKEN` 保护）
 - 文本后处理：中文数值归一化（可开关），更适合直接生成可读稿件
 
-![控制台界面](img/README-1774106121505.png)
+![控制台界面](img/README-1774106306470.png)
 
 ## 快速开始
 ```bash
