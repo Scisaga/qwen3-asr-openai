@@ -1,15 +1,7 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="g" x1="6" y1="6" x2="58" y2="60" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#60A5FA"/>
-      <stop offset="1" stop-color="#22C55E"/>
-    </linearGradient>
-  </defs>
-  <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#g)"/>
-  <rect x="4" y="4" width="56" height="56" rx="16" stroke="rgba(255,255,255,0.20)" stroke-width="1"/>
-  <path d="M14 40 C18 40, 20 28, 24 28 C28 28, 30 46, 32 46 C34 46, 36 24, 40 24 C44 24, 46 40, 50 40"
-        stroke="rgba(255,255,255,0.94)" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="50" cy="22" r="3" fill="rgba(255,255,255,0.94)"/>
-</svg>
-
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<!-- Uploaded to: SVG Repo, www.svgrepo.com, Transformed by: SVG Repo Mixer Tools -->
+<svg fill="#00a89d" version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 32.00 32.00" xml:space="preserve" width="800px" height="800px" stroke="#00a89d" stroke-width="0.00032">
+<g id="SVGRepo_bgCarrier" stroke-width="0"/>
+<g id="SVGRepo_tracerCarrier" stroke-linecap="round" stroke-linejoin="round"/>
+<g id="SVGRepo_iconCarrier"> <g id="speech--to--text_1_"> <rect x="16" y="11.64" width="12" height="0.72"/> <rect x="16" y="5.64" width="12" height="0.72"/> <path d="M4.359,8.002c0-0.904,0.736-1.64,1.64-1.64h3.146L6.931,8.576L7.44,9.084l2.829-2.828c0.068-0.067,0.105-0.159,0.105-0.254 s-0.038-0.187-0.105-0.254L7.44,2.919L6.931,3.428l2.214,2.214H6c-1.301,0-2.36,1.059-2.36,2.36v4.5h0.72L4.359,8.002L4.359,8.002z "/> <rect x="16" y="17.64" width="12" height="0.721"/> <path d="M31,0.64H13c-0.199,0-0.36,0.161-0.36,0.36v13.64H3c-1.301,0-2.36,1.059-2.36,2.36v8c0,1.302,1.059,2.36,2.36,2.36h3.777 l1.901,3.801l0.644-0.322l-2-4C7.261,26.717,7.136,26.64,7,26.64H3c-0.904,0-1.64-0.735-1.64-1.64v-8c0-0.904,0.736-1.64,1.64-1.64 h9.64v4.713C12.267,20.218,12,20.575,12,21s0.267,0.782,0.64,0.927V23c0,0.199,0.161,0.36,0.36,0.36h3.64V25 c0,0.904-0.736,1.64-1.64,1.64H9v0.721h6c1.301,0,2.36-1.059,2.36-2.36v-1.64H31c0.199,0,0.36-0.161,0.36-0.36V1 C31.36,0.801,31.199,0.64,31,0.64z M30.64,22.64H13.36V1.36h17.28V22.64z"/> <circle cx="5" cy="21" r="1"/> <circle cx="9" cy="21" r="1"/> </g> <rect id="_Transparent_Rectangle" style="fill:none;" width="32" height="32"/> </g>
+</svg>
