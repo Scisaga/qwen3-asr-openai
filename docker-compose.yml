@@ -19,6 +19,7 @@ services:
       DTYPE: "bfloat16"          # cpu 用 float32
       MAX_NEW_TOKENS: "512"
       MAX_BATCH: "1"             # 1.7B 模型/长音频更稳；显存充足可调大提升吞吐
+      MAX_CONCURRENT_TRANSCRIBE: "1" # 单个后端 worker 内的并发上限；多卡时每张卡 1 个 worker
 
       # 长音频切片与拼接
       CHUNK_SECONDS: "600"        # 每段时长（秒）
@@ -42,6 +43,14 @@ services:
 
       # 服务端口（默认 12301）
       PORT: "12301"
+      # 多卡默认行为：
+      # - 当容器可见多张 GPU 且 AUTO_BACKEND_REPLICAS=1 时，
+      #   外层服务会按“每张卡 1 个 ASR worker”启动，并轮询分发请求
+      # - 如果只想保留单进程/单卡行为，可设置 AUTO_BACKEND_REPLICAS=0
+      # - worker 监听 127.0.0.1:${BACKEND_PORT}+N，不对外暴露
+      BACKEND_HOST: "127.0.0.1"
+      BACKEND_PORT: "8001"
+      AUTO_BACKEND_REPLICAS: "1"
 
       # 热重载保护（可选）
       ADMIN_TOKEN: "change-me"
@@ -52,5 +61,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              # 选卡：宿主机第 1 张卡写 "0"，第 2 张卡写 "1"
+              # 如果这里写 ["0","1"]，默认会在两张卡上各起 1 个 ASR worker 并支持并发转写
+              device_ids: ["0"]
               capabilities: [gpu]

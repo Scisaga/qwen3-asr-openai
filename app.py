@@ -10,10 +10,12 @@ from mcp_server import mcp
 from transcription_service import (
     ADMIN_TOKEN,
     BackendTranscriptionError,
+    BackendUnavailableError,
     CudaOOMTranscriptionError,
     get_health_payload,
     guess_audio_suffix,
-    load_model,
+    reload_model_backend,
+    shutdown_backend,
     transcribe_input_bytes,
 )
 
@@ -21,7 +23,10 @@ from transcription_service import (
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     async with mcp.session_manager.run():
-        yield
+        try:
+            yield
+        finally:
+            await shutdown_backend()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -675,8 +680,8 @@ async def admin_reload(request: Request):
     current_health = get_health_payload()
     model_id = body.get("model_id", current_health["model_id"])
     revision = body.get("revision", current_health["revision"])
-    load_model(model_id, revision)
-    return {"status": "reloaded", "model_id": model_id, "revision": revision}
+    payload = await reload_model_backend(model_id, revision)
+    return {"status": "reloaded", "model_id": model_id, "revision": revision, "health": payload}
 
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
@@ -700,6 +705,11 @@ async def transcriptions(
         )
     except CudaOOMTranscriptionError as exc:
         raise HTTPException(status_code=507, detail=exc.detail) from exc
+    except BackendUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "backend_unavailable", "exception": str(exc)},
+        ) from exc
     except BackendTranscriptionError as exc:
         raise HTTPException(
             status_code=500,

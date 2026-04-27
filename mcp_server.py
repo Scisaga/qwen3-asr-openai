@@ -5,6 +5,7 @@ from mcp.server.fastmcp import FastMCP
 
 from transcription_service import (
     BackendTranscriptionError,
+    BackendUnavailableError,
     CudaOOMTranscriptionError,
     MCP_MAX_INPUT_BYTES,
     decode_audio_base64,
@@ -69,6 +70,8 @@ async def transcribe_audio_impl(
         )
     except CudaOOMTranscriptionError as exc:
         raise RuntimeError(json.dumps(exc.detail, ensure_ascii=False)) from exc
+    except BackendUnavailableError as exc:
+        raise RuntimeError(f"backend_unavailable: {exc}") from exc
     except BackendTranscriptionError as exc:
         raise RuntimeError(f"transcribe_failed: {exc}") from exc
 

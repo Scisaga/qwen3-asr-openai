@@ -7,8 +7,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
-from typing import Optional
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Optional
 
 from text_normalize import normalize_zh_numbers
 
@@ -28,11 +33,26 @@ NORMALIZE_ZH_NUMBERS = (
     not in ("0", "false", "no", "off")
 )
 MCP_MAX_INPUT_BYTES = int(os.getenv("MCP_MAX_INPUT_BYTES", str(32 * 1024 * 1024)))
+BACKEND_HOST = os.getenv("BACKEND_HOST", "127.0.0.1")
+BACKEND_PORT = int(os.getenv("BACKEND_PORT") or os.getenv("ASR_BACKEND_PORT", "8001"))
+BACKEND_START_TIMEOUT = int(os.getenv("BACKEND_START_TIMEOUT", "600"))
+BACKEND_HTTP_TIMEOUT = float(os.getenv("BACKEND_HTTP_TIMEOUT", "3600"))
+BACKEND_POLL_INTERVAL = float(os.getenv("BACKEND_POLL_INTERVAL", "1.0"))
+AUTO_BACKEND_REPLICAS_ENV = "AUTO_BACKEND_REPLICAS"
+BACKEND_REPLICA_COUNT_ENV = "BACKEND_REPLICA_COUNT"
+ASR_BACKEND_WORKER_ENV = "ASR_BACKEND_WORKER"
+MANAGE_BACKEND_PROCESS_ENV = "MANAGE_BACKEND_PROCESS"
 
 _model = None
 _current_model_id = MODEL_ID
 _current_model_revision = MODEL_REVISION
 _transcribe_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_TRANSCRIBE))
+_backend_lock = threading.RLock()
+_backend_replicas: list["BackendReplica"] = []
+_backend_router_index = 0
+_backend_started_at: Optional[float] = None
+_backend_ready = False
+_backend_last_error = ""
 
 _SAFE_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,15}$")
 _MIME_SUFFIX_OVERRIDES = {
@@ -69,8 +89,404 @@ class CudaOOMTranscriptionError(RuntimeError):
         super().__init__(detail.get("message", "CUDA out of memory"))
 
 
+class BackendUnavailableError(RuntimeError):
+    pass
+
+
 class BackendTranscriptionError(RuntimeError):
     pass
+
+
+@dataclass
+class BackendReplica:
+    replica_index: int
+    port: int
+    base_url: str
+    device_identifier: Optional[str] = None
+    process: Optional[subprocess.Popen[Any]] = None
+    started_at: Optional[float] = None
+    ready: bool = False
+    last_error: str = ""
+    health: Optional[dict[str, Any]] = None
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _is_backend_worker() -> bool:
+    return _env_flag(ASR_BACKEND_WORKER_ENV, "0")
+
+
+def _apply_proxy_env(target_env: Optional[dict[str, str]] = None) -> dict[str, str]:
+    env = target_env if target_env is not None else os.environ
+    http_proxy = (env.get("HTTP_PROXY") or os.getenv("HTTP_PROXY") or "").strip()
+    https_proxy = (env.get("HTTPS_PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
+    no_proxy = (env.get("NO_PROXY") or os.getenv("NO_PROXY") or "").strip()
+
+    if http_proxy:
+        env["HTTP_PROXY"] = http_proxy
+        env["http_proxy"] = http_proxy
+        if not https_proxy:
+            https_proxy = http_proxy
+        env["HTTPS_PROXY"] = https_proxy
+        env["https_proxy"] = https_proxy
+
+    env["NO_PROXY"] = no_proxy or "localhost,127.0.0.1"
+    env["no_proxy"] = env["NO_PROXY"]
+    return env
+
+
+def _is_cuda_device_map(device_map: str) -> bool:
+    normalized = (device_map or "").strip().lower()
+    return normalized == "cuda" or normalized.startswith("cuda:")
+
+
+def _backend_replica_count_override() -> Optional[int]:
+    raw_value = os.getenv(BACKEND_REPLICA_COUNT_ENV, "").strip()
+    if not raw_value:
+        return None
+    try:
+        count = int(raw_value)
+    except ValueError as exc:
+        raise BackendUnavailableError(
+            f"Invalid {BACKEND_REPLICA_COUNT_ENV}: expected positive integer, got {raw_value!r}."
+        ) from exc
+    if count < 1:
+        raise BackendUnavailableError(
+            f"Invalid {BACKEND_REPLICA_COUNT_ENV}: expected positive integer, got {raw_value!r}."
+        )
+    return count
+
+
+def _detect_visible_gpu_identifiers() -> list[str]:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_apply_proxy_env(dict(os.environ)),
+        )
+        if result.returncode == 0:
+            gpu_count = sum(1 for line in result.stdout.splitlines() if line.strip().startswith("GPU "))
+            if gpu_count > 0:
+                return [str(index) for index in range(gpu_count)]
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        pass
+
+    for env_name in ("CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"):
+        raw_value = os.getenv(env_name, "").strip()
+        if not raw_value:
+            continue
+        lowered = raw_value.lower()
+        if lowered in ("none", "void"):
+            return []
+        if lowered == "all":
+            continue
+        identifiers = [token.strip() for token in raw_value.split(",") if token.strip()]
+        if identifiers:
+            if any(identifier.startswith("GPU-") for identifier in identifiers):
+                return [str(index) for index in range(len(identifiers))]
+            return identifiers
+    return []
+
+
+def should_manage_backend_process() -> bool:
+    if _is_backend_worker():
+        return False
+
+    raw_value = os.getenv(MANAGE_BACKEND_PROCESS_ENV, "").strip().lower()
+    if raw_value:
+        return raw_value not in ("0", "false", "no", "off")
+
+    replica_override = _backend_replica_count_override()
+    if replica_override is not None:
+        return replica_override > 1
+    if not _env_flag(AUTO_BACKEND_REPLICAS_ENV, "1"):
+        return False
+
+    return len(_detect_visible_gpu_identifiers()) > 1
+
+
+def _desired_backend_device_identifiers() -> list[Optional[str]]:
+    if not should_manage_backend_process():
+        return []
+
+    identifiers = _detect_visible_gpu_identifiers()
+    replica_override = _backend_replica_count_override()
+    if replica_override is not None:
+        if identifiers and replica_override > len(identifiers):
+            raise BackendUnavailableError(
+                f"{BACKEND_REPLICA_COUNT_ENV}={replica_override} exceeds visible GPU count ({len(identifiers)})."
+            )
+        if identifiers:
+            return identifiers[:replica_override]
+        return [str(index) for index in range(replica_override)]
+
+    if len(identifiers) <= 1:
+        if os.getenv(MANAGE_BACKEND_PROCESS_ENV, "").strip().lower() not in ("", "0", "false", "no", "off"):
+            return identifiers or [None]
+        return []
+    return identifiers
+
+
+def _build_backend_replicas_layout() -> list[BackendReplica]:
+    return [
+        BackendReplica(
+            replica_index=index,
+            port=BACKEND_PORT + index,
+            base_url=f"http://{BACKEND_HOST}:{BACKEND_PORT + index}",
+            device_identifier=device_identifier,
+        )
+        for index, device_identifier in enumerate(_desired_backend_device_identifiers())
+    ]
+
+
+def _same_replica_layout(current: list[BackendReplica], desired: list[BackendReplica]) -> bool:
+    if len(current) != len(desired):
+        return False
+    for current_replica, desired_replica in zip(current, desired):
+        if current_replica.port != desired_replica.port:
+            return False
+        if current_replica.device_identifier != desired_replica.device_identifier:
+            return False
+    return True
+
+
+def _replica_alive(replica: BackendReplica) -> bool:
+    return replica.process is not None and replica.process.poll() is None
+
+
+def _refresh_backend_summary_locked() -> None:
+    global _backend_ready, _backend_last_error, _backend_started_at
+
+    ready_replicas = [replica for replica in _backend_replicas if replica.ready]
+    _backend_ready = bool(ready_replicas)
+    _backend_last_error = "" if ready_replicas else next(
+        (replica.last_error for replica in _backend_replicas if replica.last_error),
+        _backend_last_error,
+    )
+    started_at_values = [replica.started_at for replica in _backend_replicas if replica.started_at is not None]
+    _backend_started_at = min(started_at_values) if started_at_values else None
+
+
+def _ensure_backend_layout_locked() -> None:
+    global _backend_replicas, _backend_router_index
+
+    desired_layout = _build_backend_replicas_layout()
+    if _same_replica_layout(_backend_replicas, desired_layout):
+        return
+
+    _backend_replicas = desired_layout
+    _backend_router_index = 0
+    _refresh_backend_summary_locked()
+
+
+def _build_backend_env(replica: BackendReplica) -> dict[str, str]:
+    env = _apply_proxy_env(dict(os.environ))
+    env[ASR_BACKEND_WORKER_ENV] = "1"
+    env["HOST"] = BACKEND_HOST
+    env["PORT"] = str(replica.port)
+    env["PRELOAD_MODEL"] = "1"
+    env["HF_HOME"] = os.getenv("HF_HOME", "/models")
+    if replica.device_identifier is not None:
+        env["CUDA_VISIBLE_DEVICES"] = replica.device_identifier
+        if _is_cuda_device_map(env.get("DEVICE_MAP", DEVICE_MAP)):
+            # A worker sees exactly one GPU, so its local CUDA index is always 0.
+            env["DEVICE_MAP"] = "cuda:0"
+    return env
+
+
+def _start_backend_process_locked() -> None:
+    global _backend_last_error
+
+    if not should_manage_backend_process():
+        return
+
+    _ensure_backend_layout_locked()
+    if not _backend_replicas:
+        _backend_last_error = "No ASR backend replicas are configured."
+        raise BackendUnavailableError(_backend_last_error)
+
+    server_path = os.path.join(os.path.dirname(__file__), "server.py")
+    for replica in _backend_replicas:
+        if _replica_alive(replica):
+            continue
+
+        command = [sys.executable, "-u", server_path]
+        try:
+            replica.process = subprocess.Popen(
+                command,
+                cwd=os.path.dirname(__file__) or None,
+                env=_build_backend_env(replica),
+                stdin=subprocess.DEVNULL,
+                stdout=None,
+                stderr=None,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            replica.process = None
+            replica.ready = False
+            replica.last_error = f"Failed to start ASR backend replica {replica.replica_index}: {exc}"
+            _backend_last_error = replica.last_error
+            raise BackendUnavailableError(_backend_last_error) from exc
+
+        replica.started_at = time.time()
+        replica.ready = False
+        replica.last_error = ""
+        replica.health = None
+
+    _backend_last_error = ""
+    _refresh_backend_summary_locked()
+
+
+def _stop_backend_process_locked() -> None:
+    for replica in _backend_replicas:
+        proc = replica.process
+        replica.process = None
+        replica.ready = False
+        replica.health = None
+
+        if proc is None or proc.poll() is not None:
+            continue
+
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    _refresh_backend_summary_locked()
+
+
+def _probe_single_backend_health(base_url: str) -> tuple[bool, Optional[dict[str, Any]], str]:
+    import httpx
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(3.0, connect=1.0)) as client:
+            response = client.get(f"{base_url.rstrip('/')}/health")
+    except httpx.HTTPError as exc:
+        return False, None, str(exc)
+
+    if response.status_code >= 400:
+        return False, None, f"/health returned HTTP {response.status_code} on {base_url}"
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return False, None, "Backend returned non-JSON health payload."
+
+    if payload.get("model_loaded") is False:
+        return False, payload, "ASR backend model is not loaded yet."
+    return True, payload, ""
+
+
+def _probe_backend_health() -> tuple[bool, Optional[dict[str, Any]], str]:
+    global _backend_ready, _backend_last_error
+
+    with _backend_lock:
+        _ensure_backend_layout_locked()
+        replicas = list(_backend_replicas)
+
+    if not replicas:
+        _backend_ready = False
+        return False, None, "No ASR backend replicas are configured."
+
+    any_healthy = False
+    first_payload: Optional[dict[str, Any]] = None
+    first_error = ""
+
+    for replica in replicas:
+        healthy, payload, message = _probe_single_backend_health(replica.base_url)
+        replica.ready = healthy
+        replica.health = payload if healthy else None
+        if healthy:
+            replica.last_error = ""
+            if first_payload is None:
+                first_payload = payload
+            any_healthy = True
+        elif message:
+            replica.last_error = message
+            if not first_error:
+                first_error = message
+
+    with _backend_lock:
+        _refresh_backend_summary_locked()
+
+    if any_healthy:
+        _backend_ready = True
+        _backend_last_error = ""
+        return True, first_payload, ""
+
+    _backend_ready = False
+    if first_error:
+        _backend_last_error = first_error
+    return False, first_payload, first_error or "All ASR backend health checks failed."
+
+
+async def wait_for_backend_ready(timeout_s: Optional[float] = None) -> None:
+    global _backend_ready, _backend_last_error
+
+    deadline = time.monotonic() + float(timeout_s or BACKEND_START_TIMEOUT)
+    while time.monotonic() < deadline:
+        with _backend_lock:
+            replicas = list(_backend_replicas)
+
+        alive_replicas = [replica for replica in replicas if _replica_alive(replica)]
+        if not alive_replicas:
+            exited_replica = next(
+                (replica for replica in replicas if replica.process is not None and replica.process.poll() is not None),
+                None,
+            )
+            if exited_replica is not None and exited_replica.process is not None:
+                _backend_last_error = (
+                    f"ASR backend replica {exited_replica.replica_index} exited "
+                    f"with code {exited_replica.process.returncode}."
+                )
+            else:
+                _backend_last_error = "ASR backend process is not running."
+            _backend_ready = False
+            raise BackendUnavailableError(_backend_last_error)
+
+        healthy, _, message = await asyncio.to_thread(_probe_backend_health)
+        if healthy:
+            _backend_ready = True
+            _backend_last_error = ""
+            return
+
+        if message:
+            _backend_last_error = message
+        await asyncio.sleep(BACKEND_POLL_INTERVAL)
+
+    _backend_ready = False
+    _backend_last_error = f"Timed out after {int(timeout_s or BACKEND_START_TIMEOUT)}s waiting for ASR backends."
+    raise BackendUnavailableError(_backend_last_error)
+
+
+async def ensure_backend_started(wait_ready: bool = True, timeout_s: Optional[float] = None) -> None:
+    with _backend_lock:
+        _start_backend_process_locked()
+    if wait_ready:
+        await wait_for_backend_ready(timeout_s=timeout_s)
+
+
+async def maybe_preload_backend() -> None:
+    if not should_manage_backend_process():
+        return
+    try:
+        await ensure_backend_started(wait_ready=True)
+    except Exception as exc:
+        global _backend_ready, _backend_last_error
+        _backend_ready = False
+        _backend_last_error = str(exc)
+
+
+async def shutdown_backend() -> None:
+    with _backend_lock:
+        _stop_backend_process_locked()
 
 
 def _get_torch():
@@ -413,7 +829,119 @@ def decode_audio_base64(audio_base64: str, max_bytes: int = MCP_MAX_INPUT_BYTES)
     return decoded
 
 
-async def transcribe_input_bytes(
+def _ordered_backend_candidates_locked() -> list[BackendReplica]:
+    global _backend_router_index
+
+    if not _backend_replicas:
+        return []
+
+    ready_replicas = [replica for replica in _backend_replicas if replica.ready]
+    candidates = ready_replicas or [replica for replica in _backend_replicas if _replica_alive(replica)] or list(
+        _backend_replicas
+    )
+    start_index = _backend_router_index % len(candidates)
+    ordered = candidates[start_index:] + candidates[:start_index]
+    _backend_router_index = (_backend_router_index + 1) % len(candidates)
+    return ordered
+
+
+def _mime_type_for_suffix(suffix: str) -> str:
+    guessed = mimetypes.guess_type(f"input{suffix or '.bin'}")[0]
+    return guessed or "application/octet-stream"
+
+
+async def _post_transcription_to_backend(
+    base_url: str,
+    data: bytes,
+    suffix: str,
+    language: Optional[str],
+    prompt: Optional[str],
+) -> dict:
+    import httpx
+
+    form_data: dict[str, str] = {}
+    if language is not None:
+        form_data["language"] = language
+    if prompt is not None:
+        form_data["prompt"] = prompt
+
+    file_suffix = suffix if _SAFE_SUFFIX_RE.match(suffix or "") else ".bin"
+    files = {
+        "file": (
+            f"audio{file_suffix}",
+            data,
+            _mime_type_for_suffix(file_suffix),
+        )
+    }
+    timeout = httpx.Timeout(BACKEND_HTTP_TIMEOUT, connect=5.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{base_url.rstrip('/')}/v1/audio/transcriptions",
+                data=form_data,
+                files=files,
+            )
+    except httpx.HTTPError as exc:
+        raise BackendUnavailableError(f"Failed to reach ASR backend {base_url}: {exc}") from exc
+
+    if response.status_code >= 400:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {"detail": response.text or f"Backend returned HTTP {response.status_code}"}
+        detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+        if response.status_code == 507 and isinstance(detail, dict):
+            raise CudaOOMTranscriptionError(detail)
+        raise BackendTranscriptionError(
+            detail if isinstance(detail, str) else f"Backend returned HTTP {response.status_code}: {detail}"
+        )
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise BackendTranscriptionError("ASR backend returned non-JSON response.") from exc
+
+
+async def _transcribe_input_bytes_via_backend(
+    data: bytes,
+    suffix: str = ".bin",
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
+) -> dict:
+    await ensure_backend_started(wait_ready=True)
+
+    with _backend_lock:
+        candidates = _ordered_backend_candidates_locked()
+
+    if not candidates:
+        raise BackendUnavailableError("No ASR backend replicas are configured.")
+
+    last_unavailable: Optional[BackendUnavailableError] = None
+    for replica in candidates:
+        try:
+            result = await _post_transcription_to_backend(
+                replica.base_url,
+                data=data,
+                suffix=suffix,
+                language=language,
+                prompt=prompt,
+            )
+        except BackendUnavailableError as exc:
+            replica.ready = False
+            replica.last_error = str(exc)
+            last_unavailable = exc
+            continue
+
+        replica.ready = True
+        replica.last_error = ""
+        return result
+
+    if last_unavailable is not None:
+        raise last_unavailable
+    raise BackendUnavailableError("No ASR backend is reachable.")
+
+
+async def _transcribe_input_bytes_local(
     data: bytes,
     suffix: str = ".bin",
     language: Optional[str] = None,
@@ -449,9 +977,160 @@ async def transcribe_input_bytes(
                 pass
 
 
+async def transcribe_input_bytes(
+    data: bytes,
+    suffix: str = ".bin",
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
+) -> dict:
+    if should_manage_backend_process():
+        return await _transcribe_input_bytes_via_backend(
+            data,
+            suffix=suffix,
+            language=language,
+            prompt=prompt,
+        )
+    return await _transcribe_input_bytes_local(
+        data,
+        suffix=suffix,
+        language=language,
+        prompt=prompt,
+    )
+
+
+async def reload_model_backend(model_id: str, revision: Optional[str] = None) -> dict:
+    global _current_model_id, _current_model_revision
+
+    if should_manage_backend_process():
+        with _backend_lock:
+            _stop_backend_process_locked()
+            _current_model_id = model_id
+            _current_model_revision = revision
+            os.environ["MODEL_ID"] = model_id
+            if revision:
+                os.environ["MODEL_REVISION"] = revision
+            else:
+                os.environ.pop("MODEL_REVISION", None)
+            _start_backend_process_locked()
+
+        await wait_for_backend_ready()
+        return get_health_payload()
+
+    load_model(model_id, revision)
+    return get_health_payload()
+
+
+def _backend_state(healthy: bool, process_alive: bool, exit_code: Optional[int]) -> str:
+    if healthy:
+        return "ready"
+    if process_alive:
+        return "starting"
+    if exit_code is not None:
+        return "exited"
+    return "stopped"
+
+
+def _backend_message(
+    healthy: bool,
+    process_alive: bool,
+    exit_code: Optional[int],
+    probe_message: str,
+) -> str:
+    if healthy:
+        return ""
+    if process_alive:
+        return (
+            "ASR backend worker 已启动，但健康检查尚未就绪。"
+            "这通常表示模型仍在加载权重到 GPU。"
+        )
+    if exit_code is not None:
+        return _backend_last_error or f"ASR backend exited with code {exit_code}."
+    return _backend_last_error or probe_message or "ASR backend is not reachable."
+
+
+def _managed_backend_runtime_locked() -> tuple[Optional[int], Optional[int], bool, int, list[dict[str, Any]]]:
+    details: list[dict[str, Any]] = []
+    for replica in _backend_replicas:
+        process_alive = _replica_alive(replica)
+        exit_code = replica.process.poll() if replica.process is not None else None
+        details.append(
+            {
+                "replica_index": replica.replica_index,
+                "base_url": replica.base_url,
+                "port": replica.port,
+                "device_identifier": replica.device_identifier,
+                "ready": replica.ready,
+                "process_alive": process_alive,
+                "pid": replica.process.pid if replica.process is not None else None,
+                "exit_code": exit_code,
+                "last_error": replica.last_error,
+            }
+        )
+
+    backend_pid = details[0]["pid"] if details else None
+    backend_exit_code = next((detail["exit_code"] for detail in details if detail["exit_code"] is not None), None)
+    backend_process_alive = any(detail["process_alive"] for detail in details)
+    backend_ready_count = sum(1 for detail in details if detail["ready"])
+    return backend_pid, backend_exit_code, backend_process_alive, backend_ready_count, details
+
+
 def get_health_payload() -> dict:
+    if should_manage_backend_process():
+        healthy, backend_health, message = _probe_backend_health()
+        backend_pid: Optional[int] = None
+        backend_exit_code: Optional[int] = None
+        backend_process_alive = False
+        backend_ready_count = 1 if healthy else 0
+        backend_replica_details: list[dict[str, Any]] = []
+        with _backend_lock:
+            (
+                backend_pid,
+                backend_exit_code,
+                backend_process_alive,
+                backend_ready_count,
+                backend_replica_details,
+            ) = _managed_backend_runtime_locked()
+
+        backend_state = _backend_state(healthy, backend_process_alive, backend_exit_code)
+        backend_last_error = _backend_message(healthy, backend_process_alive, backend_exit_code, message)
+        return {
+            "status": "ok" if healthy else "degraded",
+            "backend": "qwen-asr-workers",
+            "backend_ready": healthy,
+            "backend_ready_count": backend_ready_count,
+            "backend_replica_count": len(backend_replica_details),
+            "backend_state": backend_state,
+            "backend_process_alive": backend_process_alive,
+            "backend_urls": [detail["base_url"] for detail in backend_replica_details],
+            "backend_pid": backend_pid,
+            "backend_exit_code": backend_exit_code,
+            "backend_last_error": backend_last_error,
+            "backend_health": backend_health,
+            "backend_replicas": backend_replica_details,
+            "model_loaded": healthy,
+            "model_id": _current_model_id,
+            "revision": _current_model_revision,
+            "device_map": "replicated",
+            "dtype": DTYPE,
+            "max_concurrent_transcribe": MAX_CONCURRENT_TRANSCRIBE,
+            "chunk_seconds": CHUNK_SECONDS,
+            "chunk_overlap_seconds": CHUNK_OVERLAP_SECONDS,
+            "context_tail_chars": CONTEXT_TAIL_CHARS,
+            "normalize_zh_numbers": NORMALIZE_ZH_NUMBERS,
+            "mcp_max_input_bytes": MCP_MAX_INPUT_BYTES,
+            "backend_host": BACKEND_HOST,
+            "backend_port": BACKEND_PORT,
+            "auto_backend_replicas": _env_flag(AUTO_BACKEND_REPLICAS_ENV, "1"),
+            "manage_backend_process": True,
+            "started_at": _backend_started_at,
+            "server_time": datetime.now().astimezone().isoformat(),
+        }
+
     return {
         "status": "ok",
+        "backend": "qwen-asr-local",
+        "backend_ready": _model is not None,
+        "backend_replica_count": 1,
         "model_loaded": _model is not None,
         "model_id": _current_model_id,
         "revision": _current_model_revision,

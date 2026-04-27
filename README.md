@@ -116,14 +116,22 @@ curl -X POST http://localhost:12301/admin/reload \
 ```
 
 ## 多 GPU 说明
-- `deploy.resources.reservations.devices.count` 控制容器内可见的 GPU 数量。
-- `DEVICE_MAP` 控制模型放到哪一张（或哪几张）可见的 GPU 上：
+- `deploy.resources.reservations.devices.device_ids` 控制容器内可见的 GPU。只用第 1 张卡写 `["0"]`；同时使用第 1、2 张卡写 `["0","1"]`。
+- 默认 `AUTO_BACKEND_REPLICAS=1`：当容器可见多张 GPU 时，外层服务会按“每张卡 1 个 ASR worker”启动多个后端，并对 `/v1/audio/transcriptions` 与 MCP 转写请求做轮询分发，从而支持多请求并发转写。
+- 每个 worker 会被限制到单张 GPU；如果 `DEVICE_MAP` 是 `cuda:*`，worker 内会自动改为 `cuda:0`，因为该 worker 只看得到自己的那张卡。
+- `MAX_CONCURRENT_TRANSCRIBE` 控制单个 worker 内部并发，默认 `1`。多卡并发通常靠增加 worker 数量，而不是提高单 worker 并发。
+- 如果只想保留旧的单进程行为，可设置 `AUTO_BACKEND_REPLICAS=0`。
+- `BACKEND_PORT` 是 worker 起始端口，默认 `8001`；多卡时依次使用 `8001`、`8002`、...
+
+单进程模式下，`DEVICE_MAP` 控制模型放到哪一张（或哪几张）可见的 GPU 上：
   - `cuda:0` -> 使用容器内第 1 张可见 GPU
   - `cuda:1` -> 使用容器内第 2 张可见 GPU
   - `auto` -> 交给底层 HF accelerate 决定（可能会根据模型/权重在可见 GPU 间切分）
 
-如果宿主机有两张 GPU，但你只想用第 2 张，可以设置 `count: 1`，并在环境变量里设置：
-- `NVIDIA_VISIBLE_DEVICES: "1"`，同时保持 `DEVICE_MAP=cuda:0`（因为容器里只“看到”那一张 GPU）。
+如果宿主机有两张 GPU，但你只想用第 2 张，在 `docker-compose.yml` 里设置：
+```yaml
+device_ids: ["1"]
+```
 
 ## 长音频与文本后处理（可选）
 在 `docker-compose.yml` 的 `environment` 里可调：
