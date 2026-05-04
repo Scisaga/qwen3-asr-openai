@@ -38,6 +38,95 @@ class TestBackendReplicaConfig(unittest.TestCase):
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "1")
         self.assertEqual(env["DEVICE_MAP"], "cuda:0")
 
+    def test_router_prefers_least_busy_replica(self):
+        replica0 = svc.BackendReplica(
+            replica_index=0,
+            port=svc.BACKEND_PORT,
+            base_url=f"http://{svc.BACKEND_HOST}:{svc.BACKEND_PORT}",
+            ready=True,
+            in_flight=2,
+        )
+        replica1 = svc.BackendReplica(
+            replica_index=1,
+            port=svc.BACKEND_PORT + 1,
+            base_url=f"http://{svc.BACKEND_HOST}:{svc.BACKEND_PORT + 1}",
+            ready=True,
+            in_flight=0,
+        )
+        original_replicas = svc._backend_replicas
+        original_router_index = svc._backend_router_index
+        try:
+            svc._backend_replicas = [replica0, replica1]
+            svc._backend_router_index = 0
+
+            selected = svc._reserve_backend_replica_locked(set())
+
+            self.assertIs(selected, replica1)
+            self.assertEqual(replica1.in_flight, 1)
+            self.assertEqual(replica1.request_count, 1)
+        finally:
+            svc._backend_replicas = original_replicas
+            svc._backend_router_index = original_router_index
+
+    def test_router_round_robins_when_load_is_equal(self):
+        replica0 = svc.BackendReplica(
+            replica_index=0,
+            port=svc.BACKEND_PORT,
+            base_url=f"http://{svc.BACKEND_HOST}:{svc.BACKEND_PORT}",
+            ready=True,
+        )
+        replica1 = svc.BackendReplica(
+            replica_index=1,
+            port=svc.BACKEND_PORT + 1,
+            base_url=f"http://{svc.BACKEND_HOST}:{svc.BACKEND_PORT + 1}",
+            ready=True,
+        )
+        original_replicas = svc._backend_replicas
+        original_router_index = svc._backend_router_index
+        try:
+            svc._backend_replicas = [replica0, replica1]
+            svc._backend_router_index = 0
+
+            selected0 = svc._reserve_backend_replica_locked(set())
+            svc._release_backend_replica_locked(selected0, ready=True)
+            selected1 = svc._reserve_backend_replica_locked(set())
+
+            self.assertIs(selected0, replica0)
+            self.assertIs(selected1, replica1)
+        finally:
+            svc._backend_replicas = original_replicas
+            svc._backend_router_index = original_router_index
+
+    def test_router_rejects_when_all_replicas_are_at_capacity(self):
+        replica0 = svc.BackendReplica(
+            replica_index=0,
+            port=svc.BACKEND_PORT,
+            base_url=f"http://{svc.BACKEND_HOST}:{svc.BACKEND_PORT}",
+            ready=True,
+            in_flight=svc.MAX_BACKEND_IN_FLIGHT_PER_REPLICA,
+        )
+        replica1 = svc.BackendReplica(
+            replica_index=1,
+            port=svc.BACKEND_PORT + 1,
+            base_url=f"http://{svc.BACKEND_HOST}:{svc.BACKEND_PORT + 1}",
+            ready=True,
+            in_flight=svc.MAX_BACKEND_IN_FLIGHT_PER_REPLICA,
+        )
+        original_replicas = svc._backend_replicas
+        original_router_index = svc._backend_router_index
+        try:
+            svc._backend_replicas = [replica0, replica1]
+            svc._backend_router_index = 0
+
+            selected = svc._reserve_backend_replica_locked(set())
+
+            self.assertIsNone(selected)
+            self.assertEqual(replica0.in_flight, svc.MAX_BACKEND_IN_FLIGHT_PER_REPLICA)
+            self.assertEqual(replica1.in_flight, svc.MAX_BACKEND_IN_FLIGHT_PER_REPLICA)
+        finally:
+            svc._backend_replicas = original_replicas
+            svc._backend_router_index = original_router_index
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 FROM pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
 ARG PIP_INDEX_URL=https://pypi.org/simple
 

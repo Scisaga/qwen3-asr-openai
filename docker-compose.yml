@@ -51,9 +51,14 @@ services:
       BACKEND_HOST: "127.0.0.1"
       BACKEND_PORT: "8001"
       AUTO_BACKEND_REPLICAS: "1"
+      MAX_BACKEND_IN_FLIGHT_PER_REPLICA: "2" # 每个 GPU worker 最多保留 2 个进行中/排队请求，超出返回 503
 
       # 热重载保护（可选）
       ADMIN_TOKEN: "change-me"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     volumes:
       - ./models:/models
     deploy:
@@ -63,5 +68,5 @@ services:
             - driver: nvidia
               # 选卡：宿主机第 1 张卡写 "0"，第 2 张卡写 "1"
               # 如果这里写 ["0","1"]，默认会在两张卡上各起 1 个 ASR worker 并支持并发转写
-              device_ids: ["0"]
+              device_ids: ["0", "1"]
               capabilities: [gpu]

@@ -692,14 +692,19 @@ async def transcriptions(
 ):
     del temperature
 
-    payload = await file.read()
+    filename = file.filename
+    content_type = file.content_type
+    try:
+        payload = await file.read()
+    finally:
+        await file.close()
     if not payload:
         raise HTTPException(status_code=400, detail="empty file")
 
     try:
         result = await transcribe_input_bytes(
             payload,
-            suffix=guess_audio_suffix(file.filename, file.content_type),
+            suffix=guess_audio_suffix(filename, content_type),
             language=language,
             prompt=prompt,
         )
