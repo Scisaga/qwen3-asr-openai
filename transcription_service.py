@@ -25,6 +25,12 @@ MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "512"))
 MAX_BATCH = int(os.getenv("MAX_BATCH", "1"))
 MAX_CONCURRENT_TRANSCRIBE = int(os.getenv("MAX_CONCURRENT_TRANSCRIBE", "1"))
 MAX_BACKEND_IN_FLIGHT_PER_REPLICA = max(1, int(os.getenv("MAX_BACKEND_IN_FLIGHT_PER_REPLICA", "2")))
+MAX_BACKEND_QUEUE_REQUESTS = max(0, int(os.getenv("MAX_BACKEND_QUEUE_REQUESTS", "8")))
+BACKEND_QUEUE_TIMEOUT_SECONDS = max(0.0, float(os.getenv("BACKEND_QUEUE_TIMEOUT_SECONDS", "30")))
+BACKEND_QUEUE_POLL_INTERVAL_SECONDS = max(
+    0.05,
+    float(os.getenv("BACKEND_QUEUE_POLL_INTERVAL_SECONDS", "0.25")),
+)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 CHUNK_SECONDS = float(os.getenv("CHUNK_SECONDS", "600"))
 CHUNK_OVERLAP_SECONDS = float(os.getenv("CHUNK_OVERLAP_SECONDS", "1"))
@@ -51,6 +57,7 @@ _transcribe_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_TRANSCRIBE))
 _backend_lock = threading.RLock()
 _backend_replicas: list["BackendReplica"] = []
 _backend_router_index = 0
+_backend_queue_waiters = 0
 _backend_started_at: Optional[float] = None
 _backend_ready = False
 _backend_last_error = ""
@@ -881,6 +888,66 @@ def _release_backend_replica_locked(
     replica.last_error = last_error
 
 
+def _can_wait_for_backend_capacity_locked(excluded_replica_ids: set[int]) -> bool:
+    pool = _backend_candidate_pool_locked()
+    return any(
+        id(replica) not in excluded_replica_ids and (replica.ready or _replica_alive(replica))
+        for replica in pool
+    )
+
+
+def _backend_busy_error_message_locked() -> str:
+    return (
+        "All ASR backend replicas are busy "
+        f"(max in-flight per replica: {MAX_BACKEND_IN_FLIGHT_PER_REPLICA}, "
+        f"queue waiters: {_backend_queue_waiters}/{MAX_BACKEND_QUEUE_REQUESTS}, "
+        f"queue timeout: {BACKEND_QUEUE_TIMEOUT_SECONDS:g}s)."
+    )
+
+
+def _backend_busy_error_message() -> str:
+    with _backend_lock:
+        return _backend_busy_error_message_locked()
+
+
+async def _reserve_backend_replica_with_wait(
+    excluded_replica_ids: set[int],
+) -> Optional[BackendReplica]:
+    global _backend_queue_waiters
+
+    queued = False
+    deadline = time.monotonic() + BACKEND_QUEUE_TIMEOUT_SECONDS
+    try:
+        while True:
+            with _backend_lock:
+                replica = _reserve_backend_replica_locked(excluded_replica_ids)
+                if replica is not None:
+                    return replica
+
+                can_wait = (
+                    BACKEND_QUEUE_TIMEOUT_SECONDS > 0
+                    and MAX_BACKEND_QUEUE_REQUESTS > 0
+                    and _can_wait_for_backend_capacity_locked(excluded_replica_ids)
+                )
+                if not can_wait:
+                    return None
+
+                if not queued:
+                    if _backend_queue_waiters >= MAX_BACKEND_QUEUE_REQUESTS:
+                        return None
+                    _backend_queue_waiters += 1
+                    queued = True
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(BACKEND_QUEUE_POLL_INTERVAL_SECONDS, remaining))
+    finally:
+        if queued:
+            with _backend_lock:
+                _backend_queue_waiters = max(0, _backend_queue_waiters - 1)
+
+
 def _mime_type_for_suffix(suffix: str) -> str:
     guessed = mimetypes.guess_type(f"input{suffix or '.bin'}")[0]
     return guessed or "application/octet-stream"
@@ -949,8 +1016,7 @@ async def _transcribe_input_bytes_via_backend(
     attempted_replica_ids: set[int] = set()
     last_unavailable: Optional[BackendUnavailableError] = None
     while True:
-        with _backend_lock:
-            replica = _reserve_backend_replica_locked(attempted_replica_ids)
+        replica = await _reserve_backend_replica_with_wait(attempted_replica_ids)
 
         if replica is None:
             break
@@ -963,18 +1029,34 @@ async def _transcribe_input_bytes_via_backend(
             flush=True,
         )
         try:
-            result = await _post_transcription_to_backend(
-                replica.base_url,
-                data=data,
-                suffix=suffix,
-                language=language,
-                prompt=prompt,
+            backend_task = asyncio.create_task(
+                _post_transcription_to_backend(
+                    replica.base_url,
+                    data=data,
+                    suffix=suffix,
+                    language=language,
+                    prompt=prompt,
+                )
             )
+            result = await asyncio.shield(backend_task)
         except BackendUnavailableError as exc:
             with _backend_lock:
                 _release_backend_replica_locked(replica, ready=False, last_error=str(exc))
             last_unavailable = exc
             continue
+        except asyncio.CancelledError as exc:
+            try:
+                await backend_task
+            except BackendUnavailableError as backend_exc:
+                with _backend_lock:
+                    _release_backend_replica_locked(replica, ready=False, last_error=str(backend_exc))
+            except BaseException:
+                with _backend_lock:
+                    _release_backend_replica_locked(replica)
+            else:
+                with _backend_lock:
+                    _release_backend_replica_locked(replica, ready=True)
+            raise exc
         except BaseException:
             with _backend_lock:
                 _release_backend_replica_locked(replica)
@@ -986,10 +1068,7 @@ async def _transcribe_input_bytes_via_backend(
 
     if last_unavailable is not None:
         raise last_unavailable
-    raise BackendUnavailableError(
-        "All ASR backend replicas are busy "
-        f"(max in-flight per replica: {MAX_BACKEND_IN_FLIGHT_PER_REPLICA})."
-    )
+    raise BackendUnavailableError(_backend_busy_error_message())
 
 
 async def _transcribe_input_bytes_local(
@@ -1142,6 +1221,7 @@ def get_health_payload() -> dict:
         backend_process_alive = False
         backend_ready_count = 1 if healthy else 0
         backend_replica_details: list[dict[str, Any]] = []
+        backend_queue_waiters = 0
         with _backend_lock:
             (
                 backend_pid,
@@ -1150,6 +1230,7 @@ def get_health_payload() -> dict:
                 backend_ready_count,
                 backend_replica_details,
             ) = _managed_backend_runtime_locked()
+            backend_queue_waiters = _backend_queue_waiters
 
         backend_state = _backend_state(healthy, backend_process_alive, backend_exit_code)
         backend_last_error = _backend_message(healthy, backend_process_alive, backend_exit_code, message)
@@ -1174,6 +1255,10 @@ def get_health_payload() -> dict:
             "dtype": DTYPE,
             "max_concurrent_transcribe": MAX_CONCURRENT_TRANSCRIBE,
             "max_backend_in_flight_per_replica": MAX_BACKEND_IN_FLIGHT_PER_REPLICA,
+            "max_backend_queue_requests": MAX_BACKEND_QUEUE_REQUESTS,
+            "backend_queue_waiters": backend_queue_waiters,
+            "backend_queue_timeout_seconds": BACKEND_QUEUE_TIMEOUT_SECONDS,
+            "backend_queue_poll_interval_seconds": BACKEND_QUEUE_POLL_INTERVAL_SECONDS,
             "chunk_seconds": CHUNK_SECONDS,
             "chunk_overlap_seconds": CHUNK_OVERLAP_SECONDS,
             "context_tail_chars": CONTEXT_TAIL_CHARS,
@@ -1199,6 +1284,10 @@ def get_health_payload() -> dict:
         "dtype": DTYPE,
         "max_concurrent_transcribe": MAX_CONCURRENT_TRANSCRIBE,
         "max_backend_in_flight_per_replica": MAX_BACKEND_IN_FLIGHT_PER_REPLICA,
+        "max_backend_queue_requests": MAX_BACKEND_QUEUE_REQUESTS,
+        "backend_queue_waiters": _backend_queue_waiters,
+        "backend_queue_timeout_seconds": BACKEND_QUEUE_TIMEOUT_SECONDS,
+        "backend_queue_poll_interval_seconds": BACKEND_QUEUE_POLL_INTERVAL_SECONDS,
         "chunk_seconds": CHUNK_SECONDS,
         "chunk_overlap_seconds": CHUNK_OVERLAP_SECONDS,
         "context_tail_chars": CONTEXT_TAIL_CHARS,

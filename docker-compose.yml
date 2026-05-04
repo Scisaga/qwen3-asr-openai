@@ -51,7 +51,10 @@ services:
       BACKEND_HOST: "127.0.0.1"
       BACKEND_PORT: "8001"
       AUTO_BACKEND_REPLICAS: "1"
-      MAX_BACKEND_IN_FLIGHT_PER_REPLICA: "2" # 每个 GPU worker 最多保留 2 个进行中/排队请求，超出返回 503
+      MAX_BACKEND_IN_FLIGHT_PER_REPLICA: "2" # 每个 GPU worker 最多保留 2 个进行中/排队请求
+      MAX_BACKEND_QUEUE_REQUESTS: "8" # 两张卡都满时，外层最多保留 8 个等待空位的请求
+      BACKEND_QUEUE_TIMEOUT_SECONDS: "30" # 等不到空位再返回 503，避免短暂拥塞直接失败
+      BACKEND_QUEUE_POLL_INTERVAL_SECONDS: "0.25"
 
       # 热重载保护（可选）
       ADMIN_TOKEN: "change-me"
