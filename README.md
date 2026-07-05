@@ -101,6 +101,26 @@ docker run -d --name qwen3_asr_openai \
 - `GET /health`：健康检查与运行参数（切片、后处理开关等）
 - `POST /admin/reload`：热重载模型（需 `x-admin-token`）
 
+## 默认提示词
+服务内置了财经/投资类 ASR 默认提示词，用于提升口播里专有名词、英文缩写和行业词的识别稳定性。该功能不改变接口字段，仍然使用 OpenAI 兼容的 `prompt` 参数。
+
+- 默认词表维护在 `prompts/finance_terms.txt`，一行一个词或短语；空行和 `#` 注释会被忽略，重复词会自动去重。
+- 未传 `prompt` 时，服务会自动使用默认财经提示词。
+- 传入 `prompt` 时，最终上下文会按“用户 prompt 在前、默认财经词表在后”的顺序合并，方便调用方临时补充当前音频的人名、公司名、产品名或会议上下文。
+- Docker 镜像默认把词表放在 `/app/prompts/finance_terms.txt`；如需使用自定义词表，可通过 `DEFAULT_FINANCE_PROMPT_PATH` 指向新的文件路径，并把该文件挂载进容器。
+- 词表示例包括 `price in`、`DCF`、`无风险收益率`、`贴现率`、`现金流`、`财务洗澡`、`困境反转`、`去库存`、`去产能`、`基本面`、`估值`、`PE`、`财报`、`国企`、`民企`、`市值管理`、`高端消费`、`价格战` 等。
+
+自定义词表示例：
+```yaml
+services:
+  qwen3_asr:
+    environment:
+      DEFAULT_FINANCE_PROMPT_PATH: "/app/prompts/custom_terms.txt"
+    volumes:
+      - ./models:/models
+      - ./prompts/custom_terms.txt:/app/prompts/custom_terms.txt:ro
+```
+
 ## 切换模型（需重启）
 在 `docker-compose.yml` 中修改 `MODEL_ID`，然后：
 ```bash
@@ -138,7 +158,7 @@ device_ids: ["1"]
 - `CHUNK_SECONDS` / `CHUNK_OVERLAP_SECONDS`：长音频会先切片再转写；财经/投资类口播建议 `CHUNK_SECONDS=180`、`CHUNK_OVERLAP_SECONDS=3`。
 - `CONTEXT_TAIL_CHARS`：每段转写时追加上一段尾部的上下文（字符数），用于提升跨段连续性；设为 `0` 可关闭。
 - `MAX_NEW_TOKENS`：单段最大输出长度；长口播建议至少 `2048`，避免单段还没转完就被截断。
-- 默认财经 prompt：服务会在未传 `prompt` 时自动追加财经/投资术语词表；传入 `prompt` 时，会把用户 prompt 放在前面并合并默认词表。词表维护在 `prompts/finance_terms.txt`，可用 `DEFAULT_FINANCE_PROMPT_PATH` 指向自定义文件。
+- 默认财经 prompt：服务会在未传 `prompt` 时自动使用财经/投资术语词表；传入 `prompt` 时，会把用户 prompt 放在前面并合并默认词表。详细规则见“默认提示词”章节。
 - `NORMALIZE_ZH_NUMBERS`：中文数值归一化（例如 `二零二六年 -> 2026年`、`百分之五点五 -> 5.5%`），但会保留 `三五年`、`两三个月` 这类口语近似数字。
 - `MCP_MAX_INPUT_BYTES`：MCP `audio_base64` 的解码后字节上限；大文件建议改走 HTTP 上传接口。
 
