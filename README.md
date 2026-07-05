@@ -135,9 +135,11 @@ device_ids: ["1"]
 
 ## 长音频与文本后处理（可选）
 在 `docker-compose.yml` 的 `environment` 里可调：
-- `CHUNK_SECONDS` / `CHUNK_OVERLAP_SECONDS`：长音频会先切片再转写；如果你感觉段落衔接不顺，可适当增加 `CHUNK_OVERLAP_SECONDS`。
+- `CHUNK_SECONDS` / `CHUNK_OVERLAP_SECONDS`：长音频会先切片再转写；财经/投资类口播建议 `CHUNK_SECONDS=180`、`CHUNK_OVERLAP_SECONDS=3`。
 - `CONTEXT_TAIL_CHARS`：每段转写时追加上一段尾部的上下文（字符数），用于提升跨段连续性；设为 `0` 可关闭。
-- `NORMALIZE_ZH_NUMBERS`：中文数值归一化（例如 `二零二六年 -> 2026年`、`百分之五点五 -> 5.5%`）。
+- `MAX_NEW_TOKENS`：单段最大输出长度；长口播建议至少 `2048`，避免单段还没转完就被截断。
+- 默认财经 prompt：服务会在未传 `prompt` 时自动追加财经/投资术语词表；传入 `prompt` 时，会把用户 prompt 放在前面并合并默认词表。词表维护在 `prompts/finance_terms.txt`，可用 `DEFAULT_FINANCE_PROMPT_PATH` 指向自定义文件。
+- `NORMALIZE_ZH_NUMBERS`：中文数值归一化（例如 `二零二六年 -> 2026年`、`百分之五点五 -> 5.5%`），但会保留 `三五年`、`两三个月` 这类口语近似数字。
 - `MCP_MAX_INPUT_BYTES`：MCP `audio_base64` 的解码后字节上限；大文件建议改走 HTTP 上传接口。
 
 ## License

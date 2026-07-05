@@ -128,6 +128,8 @@ def _looks_like_approx_range_zh(s: str) -> bool:
     s = (s or "").strip()
     if not s:
         return False
+    if len(s) == 2 and _is_zh_digit_seq(s):
+        return True
     return bool(re.search(r"[一二三四五六七八九][一二三四五六七八九](?:十|百|千|万|亿)", s))
 
 
@@ -167,6 +169,8 @@ def normalize_zh_numbers(text: str) -> str:
     def repl_counter(m: re.Match) -> str:
         raw = m.group("n")
         if raw in _ZH_DIGITS and len(raw) == 1:
+            return m.group(0)
+        if _looks_like_approx_range_zh(raw):
             return m.group(0)
         n = _zh_num_to_str(raw)
         if n is None:

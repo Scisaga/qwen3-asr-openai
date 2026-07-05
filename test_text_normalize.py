@@ -35,6 +35,8 @@ class TestNormalizeZhNumbers(unittest.TestCase):
         self.assertEqual(normalize_zh_numbers("下调省份多达十九个"), "下调省份多达19个")
         self.assertEqual(normalize_zh_numbers("七十代到六十代再到五十代"), "70代到60代再到50代")
         self.assertEqual(normalize_zh_numbers("连续四年未达标"), "连续四年未达标")
+        self.assertEqual(normalize_zh_numbers("大概三五年就能走出来"), "大概三五年就能走出来")
+        self.assertEqual(normalize_zh_numbers("需要两三个月去库存"), "需要两三个月去库存")
         self.assertEqual(normalize_zh_numbers("1个关键细节"), "一个关键细节")
 
     def test_no_false_positive(self):

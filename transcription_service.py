@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import difflib
 import math
 import mimetypes
 import os
@@ -30,6 +31,10 @@ BACKEND_QUEUE_TIMEOUT_SECONDS = max(0.0, float(os.getenv("BACKEND_QUEUE_TIMEOUT_
 BACKEND_QUEUE_POLL_INTERVAL_SECONDS = max(
     0.05,
     float(os.getenv("BACKEND_QUEUE_POLL_INTERVAL_SECONDS", "0.25")),
+)
+DEFAULT_FINANCE_PROMPT_PATH = os.getenv(
+    "DEFAULT_FINANCE_PROMPT_PATH",
+    os.path.join(os.path.dirname(__file__), "prompts", "finance_terms.txt"),
 )
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 CHUNK_SECONDS = float(os.getenv("CHUNK_SECONDS", "600"))
@@ -74,6 +79,42 @@ _MIME_SUFFIX_OVERRIDES = {
     "video/webm": ".webm",
     "video/quicktime": ".mov",
 }
+
+_OVERLAP_IGNORED_CHARS = set(
+    " \t\r\n"
+    "，。！？、；：,.!?;:"
+    "“”‘’\"'`"
+    "（）()【】[]《》<>"
+    "…—–-~～"
+)
+
+
+def _load_prompt_terms(path: str) -> tuple[str, ...]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                term = line.strip()
+                if not term or term.startswith("#"):
+                    continue
+                if term in seen:
+                    continue
+                seen.add(term)
+                terms.append(term)
+    except FileNotFoundError:
+        return ()
+    return tuple(terms)
+
+
+def _build_default_finance_prompt(path: str = DEFAULT_FINANCE_PROMPT_PATH) -> str:
+    terms = _load_prompt_terms(path)
+    if not terms:
+        return ""
+    return "财经/投资类音频术语参考：" + "、".join(terms) + "。英文术语和缩写保持原样。"
+
+
+DEFAULT_FINANCE_PROMPT = _build_default_finance_prompt()
 
 
 class InputValidationError(ValueError):
@@ -668,7 +709,77 @@ def _max_overlap_suffix_prefix(a: str, b: str, max_len: int = 160) -> int:
     return 0
 
 
-def _merge_texts_with_overlap(texts: list[str]) -> str:
+def _overlap_units(text: str) -> list[tuple[str, int]]:
+    units: list[tuple[str, int]] = []
+    for index, ch in enumerate(text or ""):
+        if ch in _OVERLAP_IGNORED_CHARS:
+            continue
+        units.append((ch.lower() if ch.isascii() else ch, index))
+    return units
+
+
+def _fuzzy_overlap_threshold(length: int) -> float:
+    if length >= 80:
+        return 0.84
+    if length >= 40:
+        return 0.87
+    return 0.91
+
+
+def _max_fuzzy_overlap_suffix_prefix(
+    a: str,
+    b: str,
+    max_len: int = 260,
+    min_len: int = 12,
+) -> int:
+    if not a or not b:
+        return 0
+
+    a_tail = a[-max_len:]
+    b_head = b[:max_len]
+    a_units = _overlap_units(a_tail)
+    b_units = _overlap_units(b_head)
+    max_l = min(len(a_units), len(b_units))
+    if max_l < min_len:
+        return 0
+
+    for length in range(max_l, min_len - 1, -1):
+        a_norm = "".join(ch for ch, _ in a_units[-length:])
+        b_norm = "".join(ch for ch, _ in b_units[:length])
+        ratio = difflib.SequenceMatcher(None, a_norm, b_norm, autojunk=False).ratio()
+        if ratio >= _fuzzy_overlap_threshold(length):
+            return b_units[length - 1][1] + 1
+    return 0
+
+
+def _trim_overlap_boundary(merged: str, text: str, overlap: int) -> int:
+    if overlap <= 0 or not merged:
+        return overlap
+    while overlap < len(text) and text[overlap] in _OVERLAP_IGNORED_CHARS and merged[-1] in _OVERLAP_IGNORED_CHARS:
+        overlap += 1
+    return overlap
+
+
+def _joiner_for_texts(merged: str, text: str) -> str:
+    joiner = ""
+    if merged and not merged.endswith(("\n", "。", "！", "？", "!", "?", "…")) and not text.startswith(
+        ("，", "。", "！", "？", ",", ".", "!", "?", "；", ";", "：", ":", "、")
+    ):
+        a_last = merged[-1]
+        b_first = text[0]
+        if (
+            a_last.isascii()
+            and b_first.isascii()
+            and (a_last.isalnum() or a_last in ("%", "/"))
+            and b_first.isalnum()
+        ):
+            joiner = " "
+    elif merged and merged.endswith(("。", "！", "？", "!", "?", "…")) and not merged.endswith("\n"):
+        joiner = "\n"
+    return joiner
+
+
+def _merge_texts_with_overlap(texts: list[str], fuzzy: bool = False) -> str:
     merged = ""
     for text in texts:
         text = (text or "").strip()
@@ -679,26 +790,27 @@ def _merge_texts_with_overlap(texts: list[str]) -> str:
             continue
         overlap = _max_overlap_suffix_prefix(merged, text)
         if overlap > 0:
+            overlap = _trim_overlap_boundary(merged, text, overlap)
             merged += text[overlap:]
             continue
+        if fuzzy:
+            overlap = _max_fuzzy_overlap_suffix_prefix(merged, text)
+            if overlap > 0:
+                overlap = _trim_overlap_boundary(merged, text, overlap)
+                merged += text[overlap:]
+                continue
 
-        joiner = ""
-        if merged and not merged.endswith(("\n", "。", "！", "？", "!", "?", "…")) and not text.startswith(
-            ("，", "。", "！", "？", ",", ".", "!", "?", "；", ";", "：", ":", "、")
-        ):
-            a_last = merged[-1]
-            b_first = text[0]
-            if (
-                a_last.isascii()
-                and b_first.isascii()
-                and (a_last.isalnum() or a_last in ("%", "/"))
-                and b_first.isalnum()
-            ):
-                joiner = " "
-        elif merged and merged.endswith(("。", "！", "？", "!", "?", "…")) and not merged.endswith("\n"):
-            joiner = "\n"
-        merged += joiner + text
+        merged += _joiner_for_texts(merged, text) + text
     return merged
+
+
+def _build_transcription_context(prompt: Optional[str]) -> str:
+    user_prompt = (prompt or "").strip()
+    if not DEFAULT_FINANCE_PROMPT:
+        return user_prompt
+    if user_prompt:
+        return f"{user_prompt}\n{DEFAULT_FINANCE_PROMPT}"
+    return DEFAULT_FINANCE_PROMPT
 
 
 def _clear_cuda_cache() -> None:
@@ -772,7 +884,7 @@ def _transcribe_path(in_path: str, lang: Optional[str], context: str) -> tuple[s
                 prev_tail = chunk_text[-CONTEXT_TAIL_CHARS:] if chunk_text else ""
             _clear_cuda_cache()
 
-        merged_text = _merge_texts_with_overlap(texts)
+        merged_text = _merge_texts_with_overlap(texts, fuzzy=True)
         if NORMALIZE_ZH_NUMBERS and merged_text:
             merged_text = normalize_zh_numbers(merged_text)
         merged_lang = lang
@@ -1081,7 +1193,7 @@ async def _transcribe_input_bytes_local(
 
     input_path = _write_temp_input(data, suffix)
     mapped_language = map_language(language)
-    context = (prompt or "").strip()
+    context = _build_transcription_context(prompt)
 
     try:
         try:

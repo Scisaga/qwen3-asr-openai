@@ -17,13 +17,13 @@ services:
       # 推理参数
       DEVICE_MAP: "cuda:0"       # 多卡可写 "cuda:0" 或 "auto"
       DTYPE: "bfloat16"          # cpu 用 float32
-      MAX_NEW_TOKENS: "512"
+      MAX_NEW_TOKENS: "2048"
       MAX_BATCH: "1"             # 1.7B 模型/长音频更稳；显存充足可调大提升吞吐
       MAX_CONCURRENT_TRANSCRIBE: "1" # 单个后端 worker 内的并发上限；多卡时每张卡 1 个 worker
 
       # 长音频切片与拼接
-      CHUNK_SECONDS: "600"        # 每段时长（秒）
-      CHUNK_OVERLAP_SECONDS: "1"  # 段间重叠（秒）
+      CHUNK_SECONDS: "180"        # 每段时长（秒）
+      CHUNK_OVERLAP_SECONDS: "3"  # 段间重叠（秒）
       CONTEXT_TAIL_CHARS: "200"   # 每段转写时追加上一段尾部上下文（字符数；0 关闭）
 
       # 文本后处理（中文数值归一化）

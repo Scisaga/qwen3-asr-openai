@@ -19,6 +19,7 @@ COPY mcp_server.py /app/mcp_server.py
 COPY transcription_service.py /app/transcription_service.py
 COPY text_normalize.py /app/text_normalize.py
 COPY server.py /app/server.py
+COPY prompts /app/prompts
 COPY static /app/static
 EXPOSE 12301
 CMD ["python", "-u", "server.py"]
