@@ -122,6 +122,8 @@ class TestHttpApp(unittest.TestCase):
     def test_fastapi_routes_and_mcp_mount(self):
         root_resp = self.client.get("/")
         self.assertEqual(root_resp.status_code, 200)
+        self.assertIn('id="aligner_id"', root_resp.text)
+        self.assertIn("forced_aligner_model_id", root_resp.text)
 
         health_resp = self.client.get("/health")
         self.assertEqual(health_resp.status_code, 200)

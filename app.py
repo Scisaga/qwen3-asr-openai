@@ -203,6 +203,7 @@ def index():
     .kv{display:flex; justify-content:space-between; gap:10px; padding:6px 0}
     .kv .k{color:var(--muted2); font-size:12px}
     .kv .v{font-size:12px; text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+    .kv .v.long{font-size:11.5px}
 
     .main{flex:1; display:flex; flex-direction:column}
     .topbar{
@@ -602,6 +603,7 @@ def index():
         <div class="kv"><span class="k">Endpoint</span><span class="v">/v1/audio/transcriptions</span></div>
         <div class="kv"><span class="k">MCP</span><span class="v">/mcp</span></div>
         <div class="kv"><span class="k">Model</span><span class="v" id="model_id">—</span></div>
+        <div class="kv"><span class="k">Aligner</span><span class="v long" id="aligner_id">—</span></div>
         <div class="kv"><span class="k">Device</span><span class="v" id="device_map">—</span></div>
         <div class="kv"><span class="k">DType</span><span class="v" id="dtype">—</span></div>
       </div>
@@ -769,7 +771,7 @@ def index():
                     <div class="info-box">
                       <span class="label">可读资源</span>
                       <ul class="plain-list">
-                        <li><code>qwen3asr://health</code>：模型、device、dtype、切片参数</li>
+                        <li><code>qwen3asr://health</code>：模型、aligner、device、dtype、切片参数</li>
                         <li><code>qwen3asr://usage</code>：MCP 调用说明与返回格式</li>
                         <li><code>transcribe_audio_workflow</code>：转写调用提示词</li>
                         <li><code>transcript_cleanup_workflow</code>：整理转写文本提示词</li>
@@ -876,7 +878,12 @@ def index():
       try{
         const resp = await fetch('/health', { cache: 'no-store' });
         const j = await resp.json();
-        document.getElementById('model_id').textContent = j.model_id || '—';
+        const modelId = j.model_id || '—';
+        const alignerId = j.forced_aligner_model_id || '—';
+        document.getElementById('model_id').textContent = modelId;
+        document.getElementById('model_id').title = modelId;
+        document.getElementById('aligner_id').textContent = alignerId;
+        document.getElementById('aligner_id').title = alignerId;
         document.getElementById('device_map').textContent = j.device_map || '—';
         document.getElementById('dtype').textContent = j.dtype || '—';
         document.getElementById('mcp_limit').textContent = j.mcp_max_input_bytes ? humanSize(j.mcp_max_input_bytes) : '—';
@@ -906,6 +913,8 @@ def index():
         applyTimestampAvailability(j);
       }catch(e){
         document.getElementById('mcp_limit').textContent = '不可用';
+        document.getElementById('aligner_id').textContent = '—';
+        document.getElementById('aligner_id').title = '';
         chip.textContent = 'Health: unavailable';
         chip.classList.remove('ok');
         chip.classList.add('warn');
