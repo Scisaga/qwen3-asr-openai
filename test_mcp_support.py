@@ -1,7 +1,11 @@
 import json
+import os
 import unittest
 from base64 import b64encode
 from unittest.mock import AsyncMock, patch
+
+os.environ.setdefault("PRELOAD_MODEL", "0")
+os.environ.setdefault("MANAGE_BACKEND_PROCESS", "0")
 
 from transcription_service import (
     InputTooLargeError,
@@ -38,6 +42,12 @@ class TestTranscriptionHelpers(unittest.TestCase):
 
 
 class TestMcpModule(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _without_volatile_health_fields(payload: dict) -> dict:
+        normalized = dict(payload)
+        normalized.pop("server_time", None)
+        return normalized
+
     async def test_transcribe_audio_impl_success(self):
         from mcp_server import transcribe_audio_impl
 
@@ -48,12 +58,32 @@ class TestMcpModule(unittest.IsolatedAsyncioTestCase):
                 filename="clip.mp3",
                 language="zh",
                 prompt="术语表",
+                response_format="verbose_json",
+                timestamp_granularities=["sentence"],
             )
 
         self.assertEqual(result["text"], "ok")
         self.assertEqual(result["language"], "Chinese")
         mocked.assert_awaited_once()
         self.assertEqual(mocked.await_args.kwargs["suffix"], ".mp3")
+        self.assertEqual(mocked.await_args.kwargs["response_format"], "verbose_json")
+        self.assertEqual(mocked.await_args.kwargs["timestamp_granularities"], ["sentence"])
+
+    async def test_transcribe_audio_impl_validation_error(self):
+        from mcp_server import transcribe_audio_impl
+
+        payload = b64encode(b"fake-audio").decode("ascii")
+        with patch(
+            "mcp_server.transcribe_input_bytes",
+            new=AsyncMock(side_effect=InputValidationError("bad mode")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid_request: bad mode"):
+                await transcribe_audio_impl(
+                    audio_base64=payload,
+                    mime_type="audio/wav",
+                    response_format="verbose_json",
+                    timestamp_granularities=["word"],
+                )
 
     async def test_transcribe_audio_impl_backend_error(self):
         from mcp_server import transcribe_audio_impl
@@ -70,7 +100,10 @@ class TestMcpModule(unittest.IsolatedAsyncioTestCase):
     def test_health_resource_matches_service_health(self):
         from mcp_server import build_health_resource_content
 
-        self.assertEqual(json.loads(build_health_resource_content()), get_health_payload())
+        self.assertEqual(
+            self._without_volatile_health_fields(json.loads(build_health_resource_content())),
+            self._without_volatile_health_fields(get_health_payload()),
+        )
 
 
 class TestHttpApp(unittest.TestCase):
@@ -112,6 +145,48 @@ class TestHttpApp(unittest.TestCase):
         self.assertEqual(response.json(), {"text": "hello", "language": "Chinese"})
         mocked.assert_awaited_once()
         self.assertEqual(mocked.await_args.kwargs["suffix"], ".wav")
+        self.assertIsNone(mocked.await_args.kwargs["response_format"])
+        self.assertEqual(mocked.await_args.kwargs["timestamp_granularities"], [])
+
+    def test_transcriptions_route_passes_sentence_timestamp_options(self):
+        payload = {
+            "text": "hello",
+            "language": "English",
+            "duration": 1.0,
+            "sentences": [{"id": 0, "text": "hello", "start": 0.0, "end": 1.0}],
+        }
+        with patch(
+            "app.transcribe_input_bytes",
+            new=AsyncMock(return_value=payload),
+        ) as mocked:
+            response = self.client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("meeting.wav", b"RIFF....", "audio/wav")},
+                data={
+                    "language": "en",
+                    "response_format": "verbose_json",
+                    "timestamp_granularities[]": "sentence",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+        self.assertEqual(mocked.await_args.kwargs["response_format"], "verbose_json")
+        self.assertEqual(mocked.await_args.kwargs["timestamp_granularities"], ["sentence"])
+
+    def test_transcriptions_route_returns_400_for_validation_error(self):
+        with patch(
+            "app.transcribe_input_bytes",
+            new=AsyncMock(side_effect=InputValidationError("bad request")),
+        ):
+            response = self.client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("meeting.wav", b"RIFF....", "audio/wav")},
+                data={"response_format": "srt"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"detail": "bad request"})
 
 
 if __name__ == "__main__":

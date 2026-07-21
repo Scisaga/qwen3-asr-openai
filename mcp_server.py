@@ -7,6 +7,7 @@ from transcription_service import (
     BackendTranscriptionError,
     BackendUnavailableError,
     CudaOOMTranscriptionError,
+    InputValidationError,
     MCP_MAX_INPUT_BYTES,
     decode_audio_base64,
     get_health_payload,
@@ -43,11 +44,16 @@ def build_usage_resource_content() -> str:
             "- `mime_type` (optional): MIME type such as `audio/mpeg`, `audio/wav`, `video/mp4`",
             "- `language` (optional): same semantics as the HTTP API, e.g. `zh` or `en`",
             "- `prompt` (optional): domain context or proper nouns to bias transcription",
+            "- `response_format` (optional): `json` or `verbose_json`",
+            "- `timestamp_granularities` (optional): pass `[\"sentence\"]` with `verbose_json` "
+            "to return sentence-level timestamps",
             "",
             f"Limits: decoded payload must be <= {_format_bytes(MCP_MAX_INPUT_BYTES)}.",
             "For large files, use `POST /v1/audio/transcriptions` instead of MCP base64 input.",
             "",
-            'Return shape: `{"text": "...", "language": "Chinese"}`',
+            'Default return shape: `{"text": "...", "language": "Chinese"}`',
+            'Timestamp return shape: `{"text": "...", "language": "Chinese", '
+            '"duration": 12.34, "sentences": [{"id": 0, "text": "...", "start": 0.0, "end": 1.2}]}`',
         ]
     )
 
@@ -58,16 +64,22 @@ async def transcribe_audio_impl(
     mime_type: Optional[str] = None,
     language: Optional[str] = None,
     prompt: Optional[str] = None,
+    response_format: Optional[str] = None,
+    timestamp_granularities: Optional[list[str]] = None,
 ) -> dict:
-    audio_bytes = decode_audio_base64(audio_base64)
-    suffix = guess_audio_suffix(filename=filename, mime_type=mime_type)
     try:
+        audio_bytes = decode_audio_base64(audio_base64)
+        suffix = guess_audio_suffix(filename=filename, mime_type=mime_type)
         return await transcribe_input_bytes(
             audio_bytes,
             suffix=suffix,
             language=language,
             prompt=prompt,
+            response_format=response_format,
+            timestamp_granularities=timestamp_granularities,
         )
+    except InputValidationError as exc:
+        raise RuntimeError(f"invalid_request: {exc}") from exc
     except CudaOOMTranscriptionError as exc:
         raise RuntimeError(json.dumps(exc.detail, ensure_ascii=False)) from exc
     except BackendUnavailableError as exc:
@@ -83,6 +95,8 @@ async def transcribe_audio(
     mime_type: Optional[str] = None,
     language: Optional[str] = None,
     prompt: Optional[str] = None,
+    response_format: Optional[str] = None,
+    timestamp_granularities: Optional[list[str]] = None,
 ) -> dict:
     """Transcribe a base64-encoded audio or video payload."""
     return await transcribe_audio_impl(
@@ -91,6 +105,8 @@ async def transcribe_audio(
         mime_type=mime_type,
         language=language,
         prompt=prompt,
+        response_format=response_format,
+        timestamp_granularities=timestamp_granularities,
     )
 
 
@@ -114,6 +130,8 @@ def transcribe_audio_workflow() -> str:
         "call `transcribe_audio` with `audio_base64`. "
         "Pass `language` only if the user specifies it or it is strongly implied. "
         "Use `prompt` for names, jargon, or meeting context. "
+        "For sentence timestamps, pass `response_format='verbose_json'` and "
+        "`timestamp_granularities=['sentence']`. "
         f"If the decoded payload would exceed {_format_bytes(MCP_MAX_INPUT_BYTES)}, "
         "tell the user to switch to the HTTP upload endpoint `POST /v1/audio/transcriptions`."
     )

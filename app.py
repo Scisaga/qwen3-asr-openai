@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import os
 from typing import Optional
@@ -12,20 +13,34 @@ from transcription_service import (
     BackendTranscriptionError,
     BackendUnavailableError,
     CudaOOMTranscriptionError,
+    InputValidationError,
     get_health_payload,
     guess_audio_suffix,
+    maybe_preload_runtime,
     reload_model_backend,
     shutdown_backend,
     transcribe_input_bytes,
 )
 
 
+def _env_flag(name: str, default: str = "1") -> bool:
+    v = os.getenv(name, default).strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
+    preload_task: Optional[asyncio.Task] = None
     async with mcp.session_manager.run():
+        if _env_flag("PRELOAD_MODEL", "1"):
+            preload_task = asyncio.create_task(maybe_preload_runtime())
         try:
             yield
         finally:
+            if preload_task and not preload_task.done():
+                preload_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await preload_task
             await shutdown_backend()
 
 
@@ -45,15 +60,15 @@ def index():
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="theme-color" content="#0b1224"/>
-  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg"/>
-  <link rel="apple-touch-icon" href="/static/logo.svg"/>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=sentence-ts-20260721"/>
+  <link rel="apple-touch-icon" href="/static/logo.svg?v=sentence-ts-20260721"/>
   <title>Qwen3-ASR</title>
   <style>
     :root{
       --bg0:#070b16;
       --bg1:#0b1224;
-      --panel:rgba(15, 23, 42, .68);
-      --panel2:rgba(15, 23, 42, .78);
+      --panel:rgba(15, 23, 42, .62);
+      --panel2:rgba(15, 23, 42, .76);
       --border:rgba(148, 163, 184, .16);
       --border2:rgba(148, 163, 184, .24);
       --text:rgba(226, 232, 240, .92);
@@ -62,22 +77,45 @@ def index():
       --accent:#22c55e;
       --accent2:#60a5fa;
       --danger:#ef4444;
-      --shadow:0 18px 60px rgba(0,0,0,.45);
-      --radius:14px;
-      --radius2:18px;
+      --shadow:0 12px 34px rgba(0,0,0,.30);
+      --radius:8px;
+      --radius2:8px;
       --ring:0 0 0 4px rgba(96,165,250,.18);
     }
     *{box-sizing:border-box}
-    html,body{height:100%}
+    *{
+      scrollbar-width:thin;
+      scrollbar-color:rgba(148,163,184,.34) transparent;
+    }
+    *::-webkit-scrollbar{width:10px; height:10px}
+    *::-webkit-scrollbar-track{background:transparent}
+    *::-webkit-scrollbar-thumb{
+      background:rgba(148,163,184,.34);
+      border:2px solid transparent;
+      border-radius:999px;
+      background-clip:padding-box;
+    }
+    *::-webkit-scrollbar-thumb:hover{background:rgba(148,163,184,.48); background-clip:padding-box}
+    html{min-height:100%; background:var(--bg0)}
+    body{min-height:100%}
     body{
       margin:0;
       color:var(--text);
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
-      background:
-        radial-gradient(1200px 800px at 18% -10%, rgba(96,165,250,.18), transparent 60%),
-        radial-gradient(900px 650px at 92% 10%, rgba(34,197,94,.14), transparent 55%),
-        linear-gradient(180deg, var(--bg0), var(--bg1));
+      background:linear-gradient(180deg, #0a1021 0%, #090f1d 46%, #070b16 100%);
       overflow-x:hidden;
+      position:relative;
+    }
+    body::before{
+      content:"";
+      position:fixed;
+      inset:0;
+      pointer-events:none;
+      z-index:0;
+      background:
+        radial-gradient(960px 560px at 18% -12%, rgba(96,165,250,.13), transparent 64%),
+        radial-gradient(820px 520px at 92% 8%, rgba(34,197,94,.11), transparent 62%);
+      background-repeat:no-repeat;
     }
     a{color:inherit; text-decoration:none}
     .muted{color:var(--muted)}
@@ -86,13 +124,13 @@ def index():
       background:rgba(2,6,23,.55);
       border:1px solid var(--border);
       padding:2px 8px;
-      border-radius:10px;
+      border-radius:4px;
       color:rgba(226,232,240,.92);
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       font-size:.92em;
     }
 
-    .app{display:flex; min-height:100vh}
+    .app{position:relative; z-index:1; display:flex; min-height:100vh}
     .sidebar{
       width:270px;
       padding:18px 16px;
@@ -107,8 +145,8 @@ def index():
       padding:10px 10px 14px;
     }
     .mark{
-      width:34px; height:34px; border-radius:12px;
-      box-shadow: 0 12px 30px rgba(34,197,94,.14), 0 12px 30px rgba(96,165,250,.16);
+      width:34px; height:34px; border-radius:0;
+      object-fit:contain;
       display:block;
     }
     .brand-title{font-weight:700; letter-spacing:.2px}
@@ -117,7 +155,7 @@ def index():
     .nav a{
       display:flex; align-items:center; gap:10px;
       padding:10px 12px;
-      border-radius:12px;
+      border-radius:6px;
       color:var(--muted);
       border:1px solid transparent;
       background:transparent;
@@ -129,14 +167,31 @@ def index():
       border-color:rgba(34,197,94,.22);
       color:rgba(226,232,240,.96);
     }
-    .nav .dot{
-      width:8px; height:8px; border-radius:999px;
-      background:rgba(148,163,184,.55);
-      box-shadow:0 0 0 4px rgba(148,163,184,.08);
+    .icon-defs{
+      position:absolute;
+      width:0;
+      height:0;
+      overflow:hidden;
     }
-    .nav a.active .dot{
-      background:var(--accent);
-      box-shadow:0 0 0 4px rgba(34,197,94,.16);
+    .icon{
+      width:16px;
+      height:16px;
+      flex:0 0 16px;
+      color:currentColor;
+      fill:none;
+      stroke:currentColor;
+      stroke-width:1.8;
+      stroke-linecap:square;
+      stroke-linejoin:miter;
+      opacity:.82;
+    }
+    .nav .icon{
+      color:var(--muted2);
+      opacity:.78;
+    }
+    .nav a.active .icon{
+      color:var(--accent);
+      opacity:.95;
     }
     .sidebar-footer{
       margin-top:18px;
@@ -163,11 +218,12 @@ def index():
     .top-actions{display:flex; align-items:center; gap:10px}
 
     .chip{
-      padding:8px 10px;
+      padding:8px 12px;
       border-radius:999px;
       border:1px solid var(--border);
       background:rgba(15,23,42,.50);
       font-size:12px;
+      font-weight:650;
       color:var(--muted);
       white-space:nowrap;
     }
@@ -184,13 +240,18 @@ def index():
 
     .btn{
       appearance:none;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:8px;
       border:1px solid var(--border);
       background:rgba(15,23,42,.48);
       color:rgba(226,232,240,.92);
       padding:10px 12px;
-      border-radius:12px;
+      border-radius:6px;
       font-weight:600;
       font-size:13px;
+      line-height:1;
       cursor:pointer;
       transition: background .15s ease, border-color .15s ease, transform .05s ease;
       user-select:none;
@@ -205,16 +266,44 @@ def index():
     .btn.primary:hover{background:linear-gradient(180deg, rgba(34,197,94,.28), rgba(34,197,94,.16))}
     .btn.ghost{background:transparent}
 
-    .content{padding:22px 18px 40px}
+    .content{padding:18px 16px 34px}
     .section{max-width:1160px; margin:0 auto}
-    .section-head{margin:6px 0 16px}
+    .section-head{margin:2px 0 12px}
     h1{margin:0; font-size:22px; letter-spacing:.2px}
     .section-head p{margin:8px 0 0; font-size:13px}
+    .loading-banner{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      margin:0 0 10px;
+      padding:10px 12px;
+      border:1px solid rgba(96,165,250,.22);
+      border-radius:8px;
+      background:rgba(30,41,59,.44);
+      color:rgba(226,232,240,.92);
+      font-size:13px;
+    }
+    .loading-banner[hidden]{display:none}
+    .loading-dot{
+      width:10px;
+      height:10px;
+      border-radius:999px;
+      background:var(--accent2);
+      box-shadow:0 0 0 5px rgba(96,165,250,.12);
+      animation:pulse 1.2s ease-in-out infinite;
+      flex:0 0 10px;
+    }
+    .loading-title{font-weight:720}
+    .loading-text{color:var(--muted); margin-left:2px}
+    @keyframes pulse{
+      0%,100%{opacity:.42; transform:scale(.82)}
+      50%{opacity:1; transform:scale(1)}
+    }
 
     .grid{
       display:grid;
       grid-template-columns: 1.12fr .88fr;
-      gap:14px;
+      gap:10px;
     }
     .card{
       border:1px solid var(--border);
@@ -227,21 +316,59 @@ def index():
       display:flex;
       justify-content:space-between;
       align-items:center;
-      padding:14px 16px;
-      border-bottom:1px solid var(--border);
-      background:rgba(2,6,23,.16);
+      padding:11px 14px;
+      border-bottom:1px solid rgba(148,163,184,.20);
+      background:linear-gradient(180deg, rgba(30,41,59,.54), rgba(15,23,42,.26));
     }
-    .card-title{font-weight:700; font-size:13px; letter-spacing:.24px; color:rgba(226,232,240,.92)}
-    .card-body{padding:14px 16px}
+    .card-title{font-weight:760; font-size:13px; letter-spacing:.24px; color:rgba(241,245,249,.96)}
+    .card-body{padding:12px 14px}
 
-    .form{display:flex; flex-direction:column; gap:12px}
-    .row{display:grid; grid-template-columns: 1fr 1fr; gap:12px}
+    .form{display:flex; flex-direction:column; gap:10px}
+    .row{display:grid; grid-template-columns: 1fr 1fr; gap:10px}
     .field{display:flex; flex-direction:column; gap:6px}
     .label{font-size:12px; color:var(--muted2)}
+    .mode-group{
+      display:grid;
+      grid-template-columns:1fr 1fr;
+      gap:8px;
+    }
+    .mode-option{
+      position:relative;
+      min-height:42px;
+    }
+    .mode-option input{
+      position:absolute;
+      opacity:0;
+      pointer-events:none;
+    }
+    .mode-option span{
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      width:100%;
+      height:42px;
+      border-radius:6px;
+      border:1px solid var(--border);
+      background:rgba(2,6,23,.28);
+      color:var(--muted);
+      font-size:13px;
+      font-weight:650;
+      cursor:pointer;
+      transition:background .15s ease, border-color .15s ease, color .15s ease;
+    }
+    .mode-option input:checked + span{
+      border-color:rgba(34,197,94,.30);
+      background:rgba(34,197,94,.12);
+      color:rgba(226,232,240,.96);
+    }
+    .mode-option.disabled span{
+      opacity:.48;
+      cursor:not-allowed;
+    }
     input[type="text"], textarea{
       width:100%;
-      padding:12px 12px;
-      border-radius:12px;
+      padding:10px 11px;
+      border-radius:6px;
       border:1px solid var(--border);
       background:rgba(2,6,23,.38);
       color:rgba(226,232,240,.92);
@@ -258,10 +385,10 @@ def index():
 
     .drop{
       position:relative;
-      border-radius:16px;
+      border-radius:8px;
       border:1px dashed rgba(148,163,184,.28);
       background:rgba(2,6,23,.30);
-      padding:14px;
+      padding:12px;
       transition: border-color .15s ease, background .15s ease;
     }
     .drop.drag{
@@ -292,8 +419,8 @@ def index():
       border-top-color:rgba(226,232,240,.72);
       display:none;
       animation:spin .8s linear infinite;
-      margin-right:8px;
-      vertical-align:-2px;
+      margin:0;
+      vertical-align:0;
     }
     .spinner.on{display:inline-block}
     @keyframes spin{to{transform:rotate(360deg)}}
@@ -301,31 +428,90 @@ def index():
     .output-actions{
       display:flex;
       justify-content:flex-end;
-      gap:10px;
-      padding:12px 16px 14px;
-      border-top:1px solid var(--border);
-      background:rgba(2,6,23,.12);
+      gap:8px;
+      padding:10px 14px 12px;
+      border-top:1px solid rgba(148,163,184,.12);
+      background:transparent;
+    }
+    .sentences-panel{
+      padding:0 14px 12px;
+    }
+    .sentences-panel[hidden]{display:none}
+    .sentences-wrap{
+      max-height:260px;
+      overflow:auto;
+      border:1px solid var(--border);
+      border-radius:6px;
+      background:rgba(2,6,23,.24);
+    }
+    .sentences-table{
+      width:100%;
+      border-collapse:collapse;
+      table-layout:fixed;
+      font-size:12px;
+    }
+    .sentences-table th,
+    .sentences-table td{
+      padding:9px 10px;
+      border-bottom:1px solid rgba(148,163,184,.12);
+      text-align:left;
+      vertical-align:top;
+    }
+    .sentences-table th{
+      color:var(--muted2);
+      font-weight:650;
+      background:rgba(15,23,42,.42);
+      position:sticky;
+      top:0;
+      z-index:1;
+    }
+    .sentences-table tr:last-child td{border-bottom:0}
+    .time-cell{
+      width:74px;
+      color:rgba(187,247,208,.92);
+      font-variant-numeric:tabular-nums;
+      white-space:nowrap;
+    }
+    .sentence-cell{
+      color:rgba(226,232,240,.92);
+      word-break:break-word;
+      line-height:1.55;
     }
 
     .code{
-      border:1px solid var(--border);
-      background:rgba(2,6,23,.34);
-      border-radius:14px;
-      padding:12px;
-      overflow:auto;
+      border:1px solid rgba(148,163,184,.14);
+      background:rgba(2,6,23,.36);
+      border-radius:6px;
+      padding:10px 12px;
+      overflow:hidden;
+      text-align:left;
     }
-    .stack{display:flex; flex-direction:column; gap:12px}
+    .code code{
+      display:block;
+      margin:0;
+      padding:0;
+      border:0;
+      border-radius:0;
+      background:transparent;
+      color:rgba(226,232,240,.94);
+      font-size:12px;
+      line-height:1.55;
+      white-space:pre-wrap;
+      overflow-wrap:anywhere;
+      word-break:break-word;
+    }
+    .stack{display:flex; flex-direction:column; gap:10px}
     .info-grid{
       display:grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap:12px;
-      margin-top:12px;
+      gap:10px;
+      margin-top:0;
     }
     .info-box{
-      border:1px solid var(--border);
-      background:rgba(2,6,23,.24);
-      border-radius:14px;
-      padding:12px;
+      border:1px solid rgba(148,163,184,.12);
+      background:rgba(2,6,23,.16);
+      border-radius:6px;
+      padding:10px 11px;
     }
     .info-box .label{
       display:block;
@@ -346,7 +532,7 @@ def index():
       font-size:13px;
       line-height:1.7;
     }
-    .small{font-size:12px; margin-top:10px}
+    .small{font-size:12px; margin-top:8px}
 
     @media (max-width: 980px){
       .sidebar{display:none}
@@ -357,14 +543,48 @@ def index():
     @media (prefers-reduced-motion: reduce){
       *{transition:none !important}
       .spinner{animation:none}
+      .loading-dot{animation:none}
     }
   </style>
 </head>
 <body>
+  <svg class="icon-defs" aria-hidden="true" focusable="false">
+    <symbol id="i-transcribe" viewBox="0 0 24 24">
+      <path d="M4 13h3l2-6 4 12 2-6h5"/>
+    </symbol>
+    <symbol id="i-link" viewBox="0 0 24 24">
+      <path d="M8 8h8v7H8z"/>
+      <path d="M12 15v4"/>
+      <path d="M7 19h10"/>
+      <path d="M10 5v3"/>
+      <path d="M14 5v3"/>
+    </symbol>
+    <symbol id="i-doc" viewBox="0 0 24 24">
+      <path d="M7 4h7l4 4v12H7z"/>
+      <path d="M14 4v4h4"/>
+      <path d="M10 12h6"/>
+      <path d="M10 16h5"/>
+    </symbol>
+    <symbol id="i-health" viewBox="0 0 24 24">
+      <path d="M4 13h4l2-5 4 10 2-5h4"/>
+    </symbol>
+    <symbol id="i-clear" viewBox="0 0 24 24">
+      <path d="M7 7l10 10"/>
+      <path d="M17 7L7 17"/>
+    </symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24">
+      <path d="M9 9h9v11H9z"/>
+      <path d="M6 16H5V5h11v1"/>
+    </symbol>
+    <symbol id="i-code" viewBox="0 0 24 24">
+      <path d="M9 7l-5 5 5 5"/>
+      <path d="M15 7l5 5-5 5"/>
+    </symbol>
+  </svg>
   <div class="app">
     <aside class="sidebar">
       <div class="brand">
-        <img class="mark" src="/static/logo.svg" alt="Qwen3-ASR"/>
+        <img class="mark" src="/static/logo.svg?v=sentence-ts-20260721" alt="Qwen3-ASR"/>
         <div>
           <div class="brand-title">Qwen3-ASR</div>
           <div class="brand-sub">OpenAI 兼容接口 · Web 上传</div>
@@ -372,10 +592,10 @@ def index():
       </div>
 
       <nav class="nav" aria-label="导航">
-        <a class="active" href="#upload"><span class="dot" aria-hidden="true"></span> 转写</a>
-        <a href="#mcp"><span class="dot" aria-hidden="true"></span> MCP 说明</a>
-        <a href="/docs" target="_blank" rel="noreferrer"><span class="dot" aria-hidden="true"></span> API 文档</a>
-        <a href="/health" target="_blank" rel="noreferrer"><span class="dot" aria-hidden="true"></span> 健康检查</a>
+        <a class="active" href="#upload"><svg class="icon" aria-hidden="true"><use href="#i-transcribe"></use></svg> 转写</a>
+        <a href="#mcp"><svg class="icon" aria-hidden="true"><use href="#i-link"></use></svg> MCP 说明</a>
+        <a href="/docs" target="_blank" rel="noreferrer"><svg class="icon" aria-hidden="true"><use href="#i-doc"></use></svg> API 文档</a>
+        <a href="/health" target="_blank" rel="noreferrer"><svg class="icon" aria-hidden="true"><use href="#i-health"></use></svg> 健康检查</a>
       </nav>
 
       <div class="sidebar-footer" aria-label="运行信息">
@@ -396,8 +616,9 @@ def index():
         </div>
         <div class="top-actions">
           <span class="chip" id="model_chip">Model: checking…</span>
-          <a class="btn ghost" href="/docs" target="_blank" rel="noreferrer">Docs</a>
-          <a class="btn ghost" href="/redoc" target="_blank" rel="noreferrer">Redoc</a>
+          <span class="chip" id="timestamp_chip">Timestamps: checking…</span>
+          <a class="btn ghost" href="/docs" target="_blank" rel="noreferrer"><svg class="icon" aria-hidden="true"><use href="#i-doc"></use></svg>Docs</a>
+          <a class="btn ghost" href="/redoc" target="_blank" rel="noreferrer"><svg class="icon" aria-hidden="true"><use href="#i-doc"></use></svg>Redoc</a>
         </div>
       </header>
 
@@ -406,6 +627,11 @@ def index():
           <div class="section-head">
             <h1>音频/视频转写</h1>
             <p class="muted">上传文件即可转写为文本；服务端会自动抽取音频并转换为 16k 单声道 wav。</p>
+          </div>
+          <div class="loading-banner" id="loading_banner" hidden>
+            <span class="loading-dot" aria-hidden="true"></span>
+            <span class="loading-title">模型加载中</span>
+            <span class="loading-text" id="loading_text">Web 服务已启动，ASR 模型正在准备。</span>
           </div>
 
           <div class="grid">
@@ -438,9 +664,23 @@ def index():
                     </label>
                   </div>
 
+                  <div class="field">
+                    <span class="label">模式</span>
+                    <div class="mode-group" role="radiogroup" aria-label="转写模式">
+                      <label class="mode-option">
+                        <input id="mode_text" type="radio" name="transcription_mode" value="text" checked/>
+                        <span>纯文本</span>
+                      </label>
+                      <label class="mode-option" id="mode_timestamps_option">
+                        <input id="mode_timestamps" type="radio" name="transcription_mode" value="timestamps"/>
+                        <span>句子时间戳</span>
+                      </label>
+                    </div>
+                  </div>
+
                   <div class="actions">
-                    <button class="btn primary" type="submit" id="submit_btn"><span class="spinner" id="spinner" aria-hidden="true"></span>开始转写</button>
-                    <button class="btn ghost" type="button" id="clear_btn">清空结果</button>
+                    <button class="btn primary" type="submit" id="submit_btn"><svg class="icon" aria-hidden="true"><use href="#i-transcribe"></use></svg><span class="spinner" id="spinner" aria-hidden="true"></span>开始转写</button>
+                    <button class="btn ghost" type="button" id="clear_btn"><svg class="icon" aria-hidden="true"><use href="#i-clear"></use></svg>清空结果</button>
                     <span class="hint muted" id="hint">—</span>
                   </div>
                 </form>
@@ -450,14 +690,28 @@ def index():
             <div class="card">
               <div class="card-header">
                 <div class="card-title">Result</div>
-                <span class="muted2" style="font-size:12px;">JSON <code>{"text": "...", "language": "Chinese"}</code></span>
+                <span class="muted2" style="font-size:12px;">JSON <code>{"text": "...", "sentences": [...]}</code></span>
               </div>
               <div class="card-body">
                 <textarea id="out" placeholder="这里会显示转写结果..." readonly></textarea>
               </div>
+              <div class="sentences-panel" id="sentences_panel" hidden>
+                <div class="sentences-wrap">
+                  <table class="sentences-table">
+                    <thead>
+                      <tr>
+                        <th class="time-cell">开始</th>
+                        <th class="time-cell">结束</th>
+                        <th>句子</th>
+                      </tr>
+                    </thead>
+                    <tbody id="sentences_body"></tbody>
+                  </table>
+                </div>
+              </div>
               <div class="output-actions">
-                <button class="btn ghost" type="button" id="copy_btn">复制</button>
-                <a class="btn ghost" href="#api">接口示例</a>
+                <button class="btn ghost" type="button" id="copy_btn"><svg class="icon" aria-hidden="true"><use href="#i-copy"></use></svg>复制</button>
+                <a class="btn ghost" href="#api"><svg class="icon" aria-hidden="true"><use href="#i-code"></use></svg>接口示例</a>
               </div>
             </div>
 
@@ -468,7 +722,7 @@ def index():
               </div>
               <div class="card-body">
                 <div class="code">
-                  <code>curl -X POST http://localhost:12301/v1/audio/transcriptions -F file=@audio.mp3 -F language=zh</code>
+                  <code>curl -X POST http://localhost:12301/v1/audio/transcriptions -F file=@audio.mp3 -F language=zh -F response_format=verbose_json -F 'timestamp_granularities[]=sentence'</code>
                 </div>
                 <div class="muted small">提示：也可以直接打开 <a href="/docs" target="_blank" rel="noreferrer" class="muted">/docs</a> 使用 Swagger 调用。</div>
               </div>
@@ -509,6 +763,7 @@ def index():
                         <li><code>filename</code>：可选，用于推断临时文件后缀</li>
                         <li><code>mime_type</code>：可选，如 <code>audio/mpeg</code>、<code>video/mp4</code></li>
                         <li><code>language</code>、<code>prompt</code>：语种与上下文提示</li>
+                        <li><code>response_format</code>、<code>timestamp_granularities</code>：句子时间戳模式</li>
                       </ul>
                     </div>
                     <div class="info-box">
@@ -523,7 +778,7 @@ def index():
                   </div>
 
                   <div class="code">
-                    <code>{"method":"tools/call","params":{"name":"transcribe_audio","arguments":{"audio_base64":"data:audio/mp3;base64,...","filename":"audio.mp3","language":"zh"}}}</code>
+                    <code>{"method":"tools/call","params":{"name":"transcribe_audio","arguments":{"audio_base64":"data:audio/mp3;base64,...","filename":"audio.mp3","language":"zh","response_format":"verbose_json","timestamp_granularities":["sentence"]}}}</code>
                   </div>
                   <div class="muted small">提示：MCP 更适合 Agent / IDE / 桌面客户端接入；超大音频或视频文件建议走 HTTP 上传接口，避免 base64 体积膨胀。</div>
                 </div>
@@ -546,6 +801,16 @@ def index():
     const fileInput = document.getElementById('file');
     const fileMeta = document.getElementById('file_meta');
     const drop = document.getElementById('drop');
+    const modeText = document.getElementById('mode_text');
+    const modeTimestamps = document.getElementById('mode_timestamps');
+    const modeTimestampsOption = document.getElementById('mode_timestamps_option');
+    const timestampChip = document.getElementById('timestamp_chip');
+    const sentencesPanel = document.getElementById('sentences_panel');
+    const sentencesBody = document.getElementById('sentences_body');
+    const loadingBanner = document.getElementById('loading_banner');
+    const loadingText = document.getElementById('loading_text');
+    let backendLoading = false;
+    let isSubmitting = false;
 
     function humanSize(bytes){
       if (!Number.isFinite(bytes)) return '';
@@ -555,6 +820,55 @@ def index():
       while (v >= 1024 && i < units.length - 1){ v /= 1024; i++; }
       const fixed = i === 0 ? 0 : 2;
       return v.toFixed(fixed) + ' ' + units[i];
+    }
+
+    function formatSeconds(value){
+      const n = Number(value);
+      if (!Number.isFinite(n)) return '—';
+      return n.toFixed(3);
+    }
+
+    function clearSentences(){
+      sentencesBody.replaceChildren();
+      sentencesPanel.hidden = true;
+    }
+
+    function renderSentences(sentences){
+      clearSentences();
+      if (!Array.isArray(sentences) || sentences.length === 0) return;
+
+      const fragment = document.createDocumentFragment();
+      for (const sentence of sentences){
+        const tr = document.createElement('tr');
+        const start = document.createElement('td');
+        const end = document.createElement('td');
+        const text = document.createElement('td');
+        start.className = 'time-cell';
+        end.className = 'time-cell';
+        text.className = 'sentence-cell';
+        start.textContent = formatSeconds(sentence && sentence.start);
+        end.textContent = formatSeconds(sentence && sentence.end);
+        text.textContent = (sentence && sentence.text) ? String(sentence.text) : '';
+        tr.append(start, end, text);
+        fragment.appendChild(tr);
+      }
+      sentencesBody.appendChild(fragment);
+      sentencesPanel.hidden = false;
+    }
+
+    function applyTimestampAvailability(health){
+      const enabled = !!(health && health.sentence_timestamps_enabled);
+      const loaded = !!(health && health.forced_aligner_loaded);
+      modeTimestamps.disabled = !enabled;
+      modeTimestampsOption.classList.toggle('disabled', !enabled);
+      if (!enabled && modeTimestamps.checked){
+        modeText.checked = true;
+      }
+      timestampChip.textContent = enabled
+        ? (loaded ? 'Timestamps: ready' : 'Timestamps: configured')
+        : 'Timestamps: off';
+      timestampChip.classList.toggle('ok', enabled);
+      timestampChip.classList.toggle('warn', !enabled);
     }
 
     async function refreshHealth(){
@@ -567,14 +881,40 @@ def index():
         document.getElementById('dtype').textContent = j.dtype || '—';
         document.getElementById('mcp_limit').textContent = j.mcp_max_input_bytes ? humanSize(j.mcp_max_input_bytes) : '—';
         const loaded = !!j.model_loaded;
-        chip.textContent = loaded ? 'Model: loaded' : 'Model: not loaded';
+        const backendState = String(j.backend_state || (loaded ? 'ready' : 'stopped'));
+        backendLoading = !loaded && (
+          backendState === 'starting' ||
+          !!j.model_loading ||
+          !!j.backend_process_alive
+        );
+        chip.textContent = loaded
+          ? 'Model: loaded'
+          : (backendLoading ? 'Model: loading...' : 'Model: not loaded');
         chip.classList.toggle('ok', loaded);
         chip.classList.toggle('warn', !loaded);
+        loadingBanner.hidden = !backendLoading;
+        if (backendLoading){
+          const count = Number(j.backend_replica_count || 0);
+          const ready = Number(j.backend_ready_count || 0);
+          loadingText.textContent = count > 1
+            ? `Web 服务已启动，ASR worker 正在加载模型（${ready}/${count} ready）。`
+            : 'Web 服务已启动，ASR 模型正在加载，请稍候。';
+        }
+        if (!isSubmitting){
+          submitBtn.disabled = backendLoading;
+        }
+        applyTimestampAvailability(j);
       }catch(e){
         document.getElementById('mcp_limit').textContent = '不可用';
         chip.textContent = 'Health: unavailable';
         chip.classList.remove('ok');
         chip.classList.add('warn');
+        backendLoading = false;
+        loadingBanner.hidden = true;
+        if (!isSubmitting){
+          submitBtn.disabled = false;
+        }
+        applyTimestampAvailability(null);
       }
     }
 
@@ -609,6 +949,7 @@ def index():
 
     clearBtn.addEventListener('click', () => {
       out.value = '';
+      clearSentences();
       hint.textContent = '—';
     });
 
@@ -628,13 +969,30 @@ def index():
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (backendLoading){
+        hint.textContent = '模型仍在加载中';
+        return;
+      }
+      isSubmitting = true;
       hint.textContent = '上传中…';
       out.value = '';
+      clearSentences();
       submitBtn.disabled = true;
       spinner.classList.add('on');
 
       try{
         const fd = new FormData(form);
+        const wantTimestamps = modeTimestamps.checked && !modeTimestamps.disabled;
+        fd.delete('transcription_mode');
+        fd.delete('response_format');
+        fd.delete('timestamp_granularities');
+        fd.delete('timestamp_granularities[]');
+        if (wantTimestamps){
+          fd.set('response_format', 'verbose_json');
+          fd.append('timestamp_granularities[]', 'sentence');
+        }else{
+          fd.set('response_format', 'json');
+        }
         const resp = await fetch('/v1/audio/transcriptions', { method: 'POST', body: fd });
         let j = null;
         let rawText = '';
@@ -652,12 +1010,14 @@ def index():
         }
 
         out.value = (j && j.text) ? j.text : JSON.stringify(j, null, 2);
+        renderSentences(j && j.sentences);
         hint.textContent = '完成';
       }catch(err){
         out.value = String(err);
         hint.textContent = '请求异常';
       }finally{
-        submitBtn.disabled = false;
+        isSubmitting = false;
+        submitBtn.disabled = backendLoading;
         spinner.classList.remove('on');
         refreshHealth();
       }
@@ -688,6 +1048,11 @@ async def transcriptions(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    timestamp_granularities: Optional[list[str]] = Form(None),
+    timestamp_granularities_bracket: Optional[list[str]] = Form(
+        None, alias="timestamp_granularities[]"
+    ),
     temperature: Optional[float] = Form(None),
 ):
     del temperature
@@ -707,7 +1072,14 @@ async def transcriptions(
             suffix=guess_audio_suffix(filename, content_type),
             language=language,
             prompt=prompt,
+            response_format=response_format,
+            timestamp_granularities=[
+                *(timestamp_granularities or []),
+                *(timestamp_granularities_bracket or []),
+            ],
         )
+    except InputValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except CudaOOMTranscriptionError as exc:
         raise HTTPException(status_code=507, detail=exc.detail) from exc
     except BackendUnavailableError as exc:

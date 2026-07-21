@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
@@ -22,6 +23,10 @@ MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen3-ASR-1.7B")
 MODEL_REVISION = os.getenv("MODEL_REVISION")
 DEVICE_MAP = os.getenv("DEVICE_MAP", "cuda:0")
 DTYPE = os.getenv("DTYPE", "bfloat16")
+FORCED_ALIGNER_MODEL_ID = os.getenv("FORCED_ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B")
+FORCED_ALIGNER_REVISION = os.getenv("FORCED_ALIGNER_REVISION")
+FORCED_ALIGNER_DEVICE_MAP = os.getenv("FORCED_ALIGNER_DEVICE_MAP", DEVICE_MAP)
+FORCED_ALIGNER_DTYPE = os.getenv("FORCED_ALIGNER_DTYPE", DTYPE)
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "512"))
 MAX_BATCH = int(os.getenv("MAX_BATCH", "1"))
 MAX_CONCURRENT_TRANSCRIBE = int(os.getenv("MAX_CONCURRENT_TRANSCRIBE", "1"))
@@ -58,6 +63,11 @@ MANAGE_BACKEND_PROCESS_ENV = "MANAGE_BACKEND_PROCESS"
 _model = None
 _current_model_id = MODEL_ID
 _current_model_revision = MODEL_REVISION
+_model_load_lock = threading.Lock()
+_model_state_lock = threading.RLock()
+_model_loading = False
+_model_load_started_at: Optional[float] = None
+_model_last_error = ""
 _transcribe_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_TRANSCRIBE))
 _backend_lock = threading.RLock()
 _backend_replicas: list["BackendReplica"] = []
@@ -87,6 +97,21 @@ _OVERLAP_IGNORED_CHARS = set(
     "（）()【】[]《》<>"
     "…—–-~～"
 )
+
+_SENTENCE_BOUNDARY_CHARS = set("。！？!?…")
+_SUPPORTED_RESPONSE_FORMATS = {"json", "verbose_json"}
+_SUPPORTED_TIMESTAMP_GRANULARITIES = {"sentence", "segment", "word"}
+_SENTENCE_TIMESTAMP_ALIASES = {"sentence", "segment"}
+
+
+@dataclass(frozen=True)
+class TranscriptionRequestOptions:
+    response_format: str = "json"
+    timestamp_granularities: tuple[str, ...] = ()
+
+    @property
+    def return_sentence_timestamps(self) -> bool:
+        return "sentence" in self.timestamp_granularities
 
 
 def _load_prompt_terms(path: str) -> tuple[str, ...]:
@@ -159,6 +184,75 @@ class BackendReplica:
     request_count: int = 0
     last_error: str = ""
     health: Optional[dict[str, Any]] = None
+
+
+def _forced_aligner_model_id() -> str:
+    return (FORCED_ALIGNER_MODEL_ID or "").strip()
+
+
+def sentence_timestamps_enabled() -> bool:
+    return bool(_forced_aligner_model_id())
+
+
+def _model_forced_aligner_loaded() -> bool:
+    return _model is not None and getattr(_model, "forced_aligner", None) is not None
+
+
+def _flatten_option_values(values: Optional[str | Sequence[str]]) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        raw_values = [values]
+    else:
+        raw_values = [str(value) for value in values if value is not None]
+
+    flattened: list[str] = []
+    for raw_value in raw_values:
+        flattened.extend(part.strip() for part in str(raw_value).split(","))
+    return [value for value in flattened if value]
+
+
+def normalize_transcription_options(
+    response_format: Optional[str] = None,
+    timestamp_granularities: Optional[str | Sequence[str]] = None,
+) -> TranscriptionRequestOptions:
+    normalized_format = (response_format or "json").strip().lower()
+    if normalized_format not in _SUPPORTED_RESPONSE_FORMATS:
+        allowed = ", ".join(sorted(_SUPPORTED_RESPONSE_FORMATS))
+        raise InputValidationError(
+            f"response_format must be one of: {allowed}. Got {response_format!r}."
+        )
+
+    raw_granularities = _flatten_option_values(timestamp_granularities)
+    granularities: list[str] = []
+    for raw_value in raw_granularities:
+        normalized = raw_value.strip().lower()
+        if not normalized:
+            continue
+        if normalized not in _SUPPORTED_TIMESTAMP_GRANULARITIES:
+            allowed = ", ".join(sorted(_SUPPORTED_TIMESTAMP_GRANULARITIES))
+            raise InputValidationError(
+                f"timestamp_granularities only supports: {allowed}. Got {raw_value!r}."
+            )
+        if normalized == "word":
+            raise InputValidationError(
+                "timestamp_granularities=word is not supported by this service; "
+                "use sentence timestamps instead."
+            )
+        if normalized in _SENTENCE_TIMESTAMP_ALIASES:
+            normalized = "sentence"
+        if normalized not in granularities:
+            granularities.append(normalized)
+
+    if granularities and normalized_format != "verbose_json":
+        raise InputValidationError(
+            "timestamp_granularities requires response_format=verbose_json."
+        )
+
+    return TranscriptionRequestOptions(
+        response_format=normalized_format,
+        timestamp_granularities=tuple(granularities),
+    )
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -535,6 +629,17 @@ async def maybe_preload_backend() -> None:
         _backend_last_error = str(exc)
 
 
+async def maybe_preload_runtime() -> None:
+    if should_manage_backend_process():
+        await maybe_preload_backend()
+        return
+
+    try:
+        await asyncio.to_thread(load_model, _current_model_id, _current_model_revision)
+    except Exception:
+        pass
+
+
 async def shutdown_backend() -> None:
     with _backend_lock:
         _stop_backend_process_locked()
@@ -562,26 +667,62 @@ def _torch_dtype(dtype_str: str):
     return torch.float32
 
 
-def load_model(model_id: str, revision: Optional[str] = None):
+def load_model(model_id: str, revision: Optional[str] = None, *, force: bool = False):
     global _model, _current_model_id, _current_model_revision
+    global _model_loading, _model_load_started_at, _model_last_error
 
-    qwen3_asr_model = _get_qwen_asr_model()
-    kwargs = dict(
-        torch_dtype=_torch_dtype(DTYPE),
-        device_map=DEVICE_MAP,
-        max_inference_batch_size=MAX_BATCH,
-        max_new_tokens=MAX_NEW_TOKENS,
-    )
-    if revision:
-        kwargs["revision"] = revision
-    _model = qwen3_asr_model.from_pretrained(model_id, **kwargs)
-    _current_model_id = model_id
-    _current_model_revision = revision
+    with _model_load_lock:
+        with _model_state_lock:
+            if (
+                not force
+                and _model is not None
+                and _current_model_id == model_id
+                and _current_model_revision == revision
+            ):
+                return
+            _model_loading = True
+            _model_load_started_at = time.time()
+            _model_last_error = ""
+
+        try:
+            qwen3_asr_model = _get_qwen_asr_model()
+            kwargs = dict(
+                torch_dtype=_torch_dtype(DTYPE),
+                device_map=DEVICE_MAP,
+                max_inference_batch_size=MAX_BATCH,
+                max_new_tokens=MAX_NEW_TOKENS,
+            )
+            if revision:
+                kwargs["revision"] = revision
+            forced_aligner_model_id = _forced_aligner_model_id()
+            if forced_aligner_model_id:
+                forced_aligner_kwargs = {
+                    "dtype": _torch_dtype(FORCED_ALIGNER_DTYPE),
+                    "device_map": FORCED_ALIGNER_DEVICE_MAP,
+                }
+                if FORCED_ALIGNER_REVISION:
+                    forced_aligner_kwargs["revision"] = FORCED_ALIGNER_REVISION
+                kwargs["forced_aligner"] = forced_aligner_model_id
+                kwargs["forced_aligner_kwargs"] = forced_aligner_kwargs
+            loaded_model = qwen3_asr_model.from_pretrained(model_id, **kwargs)
+            with _model_state_lock:
+                _model = loaded_model
+                _current_model_id = model_id
+                _current_model_revision = revision
+                _model_last_error = ""
+        except Exception as exc:
+            with _model_state_lock:
+                _model_last_error = str(exc)
+            raise
+        finally:
+            with _model_state_lock:
+                _model_loading = False
 
 
 def ensure_model():
-    global _model
-    if _model is None:
+    with _model_state_lock:
+        missing_model = _model is None
+    if missing_model:
         load_model(_current_model_id, _current_model_revision)
 
 
@@ -804,6 +945,192 @@ def _merge_texts_with_overlap(texts: list[str], fuzzy: bool = False) -> str:
     return merged
 
 
+@dataclass(frozen=True)
+class _SentenceSlice:
+    text: str
+    alignable_length: int
+
+
+@dataclass(frozen=True)
+class _AlignmentItem:
+    text: str
+    alignable_length: int
+    start: float
+    end: float
+
+
+def _alignment_key(text: str) -> str:
+    return "".join(
+        ch.lower() if ch.isascii() else ch
+        for ch in str(text or "")
+        if ch == "'" or ch.isalnum()
+    )
+
+
+def _is_sentence_boundary(text: str, index: int) -> bool:
+    ch = text[index]
+    if ch in "\r\n":
+        return True
+    if ch in _SENTENCE_BOUNDARY_CHARS:
+        return True
+    if ch in (".", "．"):
+        prev_ch = text[index - 1] if index > 0 else ""
+        next_ch = text[index + 1] if index + 1 < len(text) else ""
+        return not (prev_ch.isdigit() and next_ch.isdigit())
+    return False
+
+
+def _split_transcript_sentences(text: str) -> list[_SentenceSlice]:
+    value = text or ""
+    sentences: list[_SentenceSlice] = []
+    start = 0
+    for index, _ in enumerate(value):
+        if not _is_sentence_boundary(value, index):
+            continue
+        chunk = value[start : index + 1].strip()
+        if chunk:
+            sentences.append(
+                _SentenceSlice(text=chunk, alignable_length=len(_alignment_key(chunk)))
+            )
+        start = index + 1
+
+    tail = value[start:].strip()
+    if tail:
+        sentences.append(_SentenceSlice(text=tail, alignable_length=len(_alignment_key(tail))))
+    return sentences
+
+
+def _coerce_finite_float(value: Any) -> Optional[float]:
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(coerced):
+        return None
+    return coerced
+
+
+def _extract_alignment_items(time_stamps: Any) -> list[_AlignmentItem]:
+    source_items = getattr(time_stamps, "items", time_stamps or [])
+    items: list[_AlignmentItem] = []
+    for item in source_items:
+        if isinstance(item, dict):
+            raw_text = item.get("text", "")
+            start_value = item.get("start_time", item.get("start"))
+            end_value = item.get("end_time", item.get("end"))
+        else:
+            raw_text = getattr(item, "text", "")
+            start_value = getattr(item, "start_time", getattr(item, "start", None))
+            end_value = getattr(item, "end_time", getattr(item, "end", None))
+
+        key = _alignment_key(str(raw_text or ""))
+        start = _coerce_finite_float(start_value)
+        end = _coerce_finite_float(end_value)
+        if not key or start is None or end is None or end < start:
+            continue
+        items.append(
+            _AlignmentItem(
+                text=str(raw_text or ""),
+                alignable_length=len(key),
+                start=start,
+                end=end,
+            )
+        )
+    return items
+
+
+def _round_timestamp(value: float, duration: Optional[float] = None) -> float:
+    if duration is not None and math.isfinite(duration) and duration > 0:
+        value = min(max(0.0, value), duration)
+    return round(float(value), 3)
+
+
+def _fallback_sentence_timestamps(
+    sentence_slices: list[_SentenceSlice],
+    duration: Optional[float],
+) -> list[dict[str, Any]]:
+    usable_duration = duration if duration is not None and math.isfinite(duration) and duration > 0 else 0.0
+    weights = [max(1, sentence.alignable_length) for sentence in sentence_slices]
+    total_weight = sum(weights) or 1
+    cursor = 0.0
+    sentences: list[dict[str, Any]] = []
+    for index, (sentence, weight) in enumerate(zip(sentence_slices, weights)):
+        start = cursor
+        if index == len(sentence_slices) - 1:
+            end = usable_duration
+        else:
+            end = cursor + usable_duration * weight / total_weight
+        cursor = end
+        sentence_text = sentence.text
+        if NORMALIZE_ZH_NUMBERS and sentence_text:
+            sentence_text = normalize_zh_numbers(sentence_text)
+        sentences.append(
+            {
+                "id": index,
+                "text": sentence_text,
+                "start": _round_timestamp(start, duration),
+                "end": _round_timestamp(end, duration),
+            }
+        )
+    return sentences
+
+
+def build_sentence_timestamps(
+    text: str,
+    time_stamps: Any,
+    duration: Optional[float] = None,
+) -> list[dict[str, Any]]:
+    sentence_slices = _split_transcript_sentences(text or "")
+    if not sentence_slices:
+        return []
+
+    alignment_items = _extract_alignment_items(time_stamps)
+    if not alignment_items:
+        return _fallback_sentence_timestamps(sentence_slices, duration)
+
+    assignments: list[list[_AlignmentItem]] = []
+    item_index = 0
+    for sentence_index, sentence in enumerate(sentence_slices):
+        start_index = item_index
+        consumed = 0
+        target = sentence.alignable_length
+        while item_index < len(alignment_items) and (
+            consumed < target or (target == 0 and item_index == start_index)
+        ):
+            consumed += alignment_items[item_index].alignable_length
+            item_index += 1
+        assigned_items = alignment_items[start_index:item_index]
+        if not assigned_items and item_index < len(alignment_items):
+            assigned_items = [alignment_items[item_index]]
+            item_index += 1
+        assignments.append(assigned_items)
+
+    if item_index < len(alignment_items) and assignments:
+        assignments[-1].extend(alignment_items[item_index:])
+
+    sentences: list[dict[str, Any]] = []
+    for index, (sentence, assigned_items) in enumerate(zip(sentence_slices, assignments)):
+        sentence_text = sentence.text
+        if NORMALIZE_ZH_NUMBERS and sentence_text:
+            sentence_text = normalize_zh_numbers(sentence_text)
+        if assigned_items:
+            start = assigned_items[0].start
+            end = assigned_items[-1].end
+        else:
+            fallback = _fallback_sentence_timestamps([sentence], duration)
+            start = fallback[0]["start"] if fallback else 0.0
+            end = fallback[0]["end"] if fallback else 0.0
+        sentences.append(
+            {
+                "id": index,
+                "text": sentence_text,
+                "start": _round_timestamp(start, duration),
+                "end": _round_timestamp(end, duration),
+            }
+        )
+    return sentences
+
+
 def _build_transcription_context(prompt: Optional[str]) -> str:
     user_prompt = (prompt or "").strip()
     if not DEFAULT_FINANCE_PROMPT:
@@ -900,6 +1227,73 @@ def _transcribe_path(in_path: str, lang: Optional[str], context: str) -> tuple[s
                 pass
         if chunk_dir:
             shutil.rmtree(chunk_dir, ignore_errors=True)
+
+
+def _transcribe_path_with_sentence_timestamps(
+    in_path: str,
+    lang: Optional[str],
+    context: str,
+) -> dict[str, Any]:
+    wav_path = None
+    try:
+        wav_path = _to_wav16k_mono(in_path)
+        duration = _ffprobe_duration_seconds(wav_path)
+        results = _model.transcribe(
+            audio=wav_path,
+            context=context,
+            language=lang,
+            return_time_stamps=True,
+        )
+
+        texts: list[str] = []
+        langs: list[str] = []
+        sentences: list[dict[str, Any]] = []
+        if results:
+            for result in results:
+                result_text = (getattr(result, "text", "") or "").strip()
+                if result_text:
+                    texts.append(result_text)
+                    sentences.extend(
+                        build_sentence_timestamps(
+                            result_text,
+                            getattr(result, "time_stamps", None),
+                            duration=duration,
+                        )
+                    )
+                result_lang = (getattr(result, "language", "") or "").strip()
+                if result_lang:
+                    langs.append(result_lang)
+
+        merged_text = _merge_texts_with_overlap(texts)
+        if NORMALIZE_ZH_NUMBERS and merged_text:
+            merged_text = normalize_zh_numbers(merged_text)
+
+        if not sentences and merged_text:
+            sentences = build_sentence_timestamps(merged_text, None, duration=duration)
+
+        for index, sentence in enumerate(sentences):
+            sentence["id"] = index
+
+        merged_lang = lang
+        if not merged_lang:
+            uniq = [value for value in dict.fromkeys([value for value in langs if value])]
+            merged_lang = ",".join(uniq) if uniq else None
+
+        duration_value = duration
+        if duration_value is None and sentences:
+            duration_value = max(float(sentence["end"]) for sentence in sentences)
+        return {
+            "text": merged_text,
+            "language": merged_lang,
+            "duration": _round_timestamp(duration_value or 0.0),
+            "sentences": sentences,
+        }
+    finally:
+        if wav_path and os.path.exists(wav_path):
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
 
 
 def _write_temp_input(data: bytes, suffix: str) -> str:
@@ -1071,14 +1465,17 @@ async def _post_transcription_to_backend(
     suffix: str,
     language: Optional[str],
     prompt: Optional[str],
+    options: TranscriptionRequestOptions,
 ) -> dict:
     import httpx
 
-    form_data: dict[str, str] = {}
+    form_data: list[tuple[str, str]] = [("response_format", options.response_format)]
     if language is not None:
-        form_data["language"] = language
+        form_data.append(("language", language))
     if prompt is not None:
-        form_data["prompt"] = prompt
+        form_data.append(("prompt", prompt))
+    for granularity in options.timestamp_granularities:
+        form_data.append(("timestamp_granularities[]", granularity))
 
     file_suffix = suffix if _SAFE_SUFFIX_RE.match(suffix or "") else ".bin"
     files = {
@@ -1122,7 +1519,9 @@ async def _transcribe_input_bytes_via_backend(
     suffix: str = ".bin",
     language: Optional[str] = None,
     prompt: Optional[str] = None,
+    options: Optional[TranscriptionRequestOptions] = None,
 ) -> dict:
+    options = options or TranscriptionRequestOptions()
     await ensure_backend_started(wait_ready=True)
 
     attempted_replica_ids: set[int] = set()
@@ -1148,6 +1547,7 @@ async def _transcribe_input_bytes_via_backend(
                     suffix=suffix,
                     language=language,
                     prompt=prompt,
+                    options=options,
                 )
             )
             result = await asyncio.shield(backend_task)
@@ -1188,8 +1588,15 @@ async def _transcribe_input_bytes_local(
     suffix: str = ".bin",
     language: Optional[str] = None,
     prompt: Optional[str] = None,
+    options: Optional[TranscriptionRequestOptions] = None,
 ) -> dict:
+    options = options or TranscriptionRequestOptions()
     ensure_model()
+    if options.return_sentence_timestamps and not _model_forced_aligner_loaded():
+        raise InputValidationError(
+            "sentence timestamps require a loaded forced aligner. "
+            "Set FORCED_ALIGNER_MODEL_ID to a Qwen3-ForcedAligner checkpoint."
+        )
 
     input_path = _write_temp_input(data, suffix)
     mapped_language = map_language(language)
@@ -1198,11 +1605,21 @@ async def _transcribe_input_bytes_local(
     try:
         try:
             async with _transcribe_sem:
-                transcribe_task = asyncio.create_task(
-                    asyncio.to_thread(_transcribe_path, input_path, mapped_language, context)
-                )
+                if options.return_sentence_timestamps:
+                    transcribe_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _transcribe_path_with_sentence_timestamps,
+                            input_path,
+                            mapped_language,
+                            context,
+                        )
+                    )
+                else:
+                    transcribe_task = asyncio.create_task(
+                        asyncio.to_thread(_transcribe_path, input_path, mapped_language, context)
+                    )
                 try:
-                    merged_text, merged_lang = await asyncio.shield(transcribe_task)
+                    result = await asyncio.shield(transcribe_task)
                 except asyncio.CancelledError:
                     try:
                         await transcribe_task
@@ -1214,6 +1631,10 @@ async def _transcribe_input_bytes_local(
                 raise CudaOOMTranscriptionError(_cuda_oom_detail(exc)) from exc
             raise BackendTranscriptionError(str(exc)) from exc
 
+        if options.return_sentence_timestamps:
+            return result
+
+        merged_text, merged_lang = result
         return {
             "text": merged_text,
             "language": merged_lang,
@@ -1231,21 +1652,32 @@ async def transcribe_input_bytes(
     suffix: str = ".bin",
     language: Optional[str] = None,
     prompt: Optional[str] = None,
+    response_format: Optional[str] = None,
+    timestamp_granularities: Optional[str | Sequence[str]] = None,
 ) -> dict:
+    options = normalize_transcription_options(
+        response_format=response_format,
+        timestamp_granularities=timestamp_granularities,
+    )
+    if options.return_sentence_timestamps and not sentence_timestamps_enabled():
+        raise InputValidationError(
+            "sentence timestamps require FORCED_ALIGNER_MODEL_ID to be configured."
+        )
     if should_manage_backend_process():
         return await _transcribe_input_bytes_via_backend(
             data,
             suffix=suffix,
             language=language,
             prompt=prompt,
+            options=options,
         )
     return await _transcribe_input_bytes_local(
         data,
         suffix=suffix,
         language=language,
         prompt=prompt,
+        options=options,
     )
-
 
 async def reload_model_backend(model_id: str, revision: Optional[str] = None) -> dict:
     global _current_model_id, _current_model_revision
@@ -1265,7 +1697,7 @@ async def reload_model_backend(model_id: str, revision: Optional[str] = None) ->
         await wait_for_backend_ready()
         return get_health_payload()
 
-    load_model(model_id, revision)
+    load_model(model_id, revision, force=True)
     return get_health_payload()
 
 
@@ -1376,6 +1808,14 @@ def get_health_payload() -> dict:
             "context_tail_chars": CONTEXT_TAIL_CHARS,
             "normalize_zh_numbers": NORMALIZE_ZH_NUMBERS,
             "mcp_max_input_bytes": MCP_MAX_INPUT_BYTES,
+            "sentence_timestamps_enabled": sentence_timestamps_enabled(),
+            "forced_aligner_model_id": _forced_aligner_model_id() or None,
+            "forced_aligner_revision": FORCED_ALIGNER_REVISION,
+            "forced_aligner_device_map": FORCED_ALIGNER_DEVICE_MAP,
+            "forced_aligner_dtype": FORCED_ALIGNER_DTYPE,
+            "forced_aligner_loaded": bool(
+                backend_health and backend_health.get("forced_aligner_loaded")
+            ),
             "backend_host": BACKEND_HOST,
             "backend_port": BACKEND_PORT,
             "auto_backend_replicas": _env_flag(AUTO_BACKEND_REPLICAS_ENV, "1"),
@@ -1384,14 +1824,41 @@ def get_health_payload() -> dict:
             "server_time": datetime.now().astimezone().isoformat(),
         }
 
+    with _model_state_lock:
+        model_loaded = _model is not None
+        model_loading = _model_loading
+        model_load_started_at = _model_load_started_at
+        model_last_error = _model_last_error
+        current_model_id = _current_model_id
+        current_model_revision = _current_model_revision
+        forced_aligner_loaded = (
+            _model is not None and getattr(_model, "forced_aligner", None) is not None
+        )
+
+    if model_loaded:
+        local_backend_state = "ready"
+        local_backend_message = ""
+    elif model_loading:
+        local_backend_state = "starting"
+        local_backend_message = "ASR 模型正在加载中，Web 服务已可访问。"
+    elif model_last_error:
+        local_backend_state = "error"
+        local_backend_message = model_last_error
+    else:
+        local_backend_state = "stopped"
+        local_backend_message = "ASR 模型尚未加载。"
+
     return {
-        "status": "ok",
+        "status": "ok" if model_loaded else "degraded",
         "backend": "qwen-asr-local",
-        "backend_ready": _model is not None,
+        "backend_ready": model_loaded,
+        "backend_state": local_backend_state,
+        "backend_last_error": local_backend_message,
+        "model_loading": model_loading,
         "backend_replica_count": 1,
-        "model_loaded": _model is not None,
-        "model_id": _current_model_id,
-        "revision": _current_model_revision,
+        "model_loaded": model_loaded,
+        "model_id": current_model_id,
+        "revision": current_model_revision,
         "device_map": DEVICE_MAP,
         "dtype": DTYPE,
         "max_concurrent_transcribe": MAX_CONCURRENT_TRANSCRIBE,
@@ -1405,4 +1872,12 @@ def get_health_payload() -> dict:
         "context_tail_chars": CONTEXT_TAIL_CHARS,
         "normalize_zh_numbers": NORMALIZE_ZH_NUMBERS,
         "mcp_max_input_bytes": MCP_MAX_INPUT_BYTES,
+        "sentence_timestamps_enabled": sentence_timestamps_enabled(),
+        "forced_aligner_model_id": _forced_aligner_model_id() or None,
+        "forced_aligner_revision": FORCED_ALIGNER_REVISION,
+        "forced_aligner_device_map": FORCED_ALIGNER_DEVICE_MAP,
+        "forced_aligner_dtype": FORCED_ALIGNER_DTYPE,
+        "forced_aligner_loaded": forced_aligner_loaded,
+        "started_at": model_load_started_at,
+        "server_time": datetime.now().astimezone().isoformat(),
     }

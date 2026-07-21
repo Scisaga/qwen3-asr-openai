@@ -17,6 +17,10 @@ services:
       # 推理参数
       DEVICE_MAP: "cuda:0"       # 多卡可写 "cuda:0" 或 "auto"
       DTYPE: "bfloat16"          # cpu 用 float32
+      # 句子级时间戳：默认加载 Qwen3-ForcedAligner；设为空字符串可关闭
+      FORCED_ALIGNER_MODEL_ID: "Qwen/Qwen3-ForcedAligner-0.6B"
+      FORCED_ALIGNER_DEVICE_MAP: "cuda:0"
+      FORCED_ALIGNER_DTYPE: "bfloat16"
       MAX_NEW_TOKENS: "2048"
       MAX_BATCH: "1"             # 1.7B 模型/长音频更稳；显存充足可调大提升吞吐
       MAX_CONCURRENT_TRANSCRIBE: "1" # 单个后端 worker 内的并发上限；多卡时每张卡 1 个 worker
@@ -71,5 +75,5 @@ services:
             - driver: nvidia
               # 选卡：宿主机第 1 张卡写 "0"，第 2 张卡写 "1"
               # 如果这里写 ["0","1"]，默认会在两张卡上各起 1 个 ASR worker 并支持并发转写
-              device_ids: ["0", "1"]
+              device_ids: ["0"]
               capabilities: [gpu]

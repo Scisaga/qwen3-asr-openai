@@ -1,15 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="g" x1="6" y1="6" x2="58" y2="60" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#60A5FA"/>
-      <stop offset="1" stop-color="#22C55E"/>
-    </linearGradient>
-  </defs>
-  <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#g)"/>
-  <rect x="4" y="4" width="56" height="56" rx="16" stroke="rgba(255,255,255,0.20)" stroke-width="1"/>
-  <path d="M14 40 C18 40, 20 28, 24 28 C28 28, 30 46, 32 46 C34 46, 36 24, 40 24 C44 24, 46 40, 50 40"
-        stroke="rgba(255,255,255,0.94)" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="50" cy="22" r="3" fill="rgba(255,255,255,0.94)"/>
+  <rect x="1" y="1" width="62" height="62" rx="6" fill="#0F172A"/>
+  <rect x="1" y="1" width="62" height="62" rx="6" stroke="#334155" stroke-width="1.5"/>
+  <rect x="12" y="25" width="4" height="14" rx=".25" fill="#60A5FA"/>
+  <rect x="21" y="18" width="4" height="28" rx=".25" fill="#E2E8F0"/>
+  <rect x="30" y="12" width="4" height="40" rx=".25" fill="#22C55E"/>
+  <rect x="39" y="18" width="4" height="28" rx=".25" fill="#E2E8F0"/>
+  <rect x="48" y="25" width="4" height="14" rx=".25" fill="#60A5FA"/>
 </svg>
-
